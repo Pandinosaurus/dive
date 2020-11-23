@@ -1,6 +1,7 @@
 """
 VIAME Fish format deserializer
 """
+import _csv
 import csv
 import datetime
 import io
@@ -10,7 +11,7 @@ from typing import Dict, Generator, List, Tuple, Union
 from viame_server.serializers.models import Feature, Track, interpolate
 
 
-def writeHeader(writer: '_csv._writer'):
+def writeHeader(writer: _csv._writer):
     writer.writerow(
         [
             "# 1: Detection or Track-id",
@@ -26,7 +27,6 @@ def writeHeader(writer: '_csv._writer'):
             "Confidence Pairs or Attributes",
         ]
     )
-
     writer.writerow(
         [f'# Written on {datetime.datetime.now().ctime()} by: viame_web_csv_writer']
     )
@@ -97,11 +97,11 @@ def _parse_row(row: List[str]) -> Tuple[Dict, Dict, Dict, List]:
     features = {}
     attributes = {}
     track_attributes = {}
-    confidence_pairs = [
+    confidence_pairs = sorted([
         [row[i], float(row[i + 1])]
         for i in range(9, len(row), 2)
         if i + 1 < len(row) and row[i] and row[i + 1] and not row[i].startswith("(")
-    ]
+    ], key=lambda p: p[1])
     head_tail = []
     start = 9 + len(confidence_pairs) * 2
 

@@ -7,9 +7,9 @@ import fs from 'fs-extra';
 
 import {
   Settings, SettingsCurrentVersion,
-  DesktopJob, DesktopJobUpdate, RunPipeline,
+  DesktopJob, DesktopJobUpdate,
+  RunPipeline, TrainPipeline,
 } from '../../constants';
-
 import common from './common';
 
 const DefaultSettings: Settings = {
@@ -20,9 +20,21 @@ const DefaultSettings: Settings = {
   // Path to a user data folder
   dataPath: '~/viamedata',
 };
+// Script to source before `kwiver` will be available
+const SetupScriptName = 'setup_viame.sh';
+// Path on viamePath where included pipelines are
+const PreTrainedPipelinesPath = 'configs/pipelines';
+// Path on viamePath to detector training executable
+const TrainingExecutablePath = 'bin/viame_train_detector';
+// Path to viamePath to training configurations
+const TrainingConfigPath = npath.join(PreTrainedPipelinesPath, 'config');
 
+/**
+ * Check viamePath, check that kwiver will initialize.
+ * @param settings user settings
+ */
 async function validateViamePath(settings: Settings): Promise<true | string> {
-  const setupScriptPath = npath.join(settings.viamePath, 'setup_viame.sh');
+  const setupScriptPath = npath.join(settings.viamePath, SetupScriptName);
   const setupExists = await fs.pathExists(setupScriptPath);
   if (!setupExists) {
     return `${setupScriptPath} does not exist`;
@@ -46,9 +58,9 @@ async function validateViamePath(settings: Settings): Promise<true | string> {
 /**
  * Fashioned as a node.js implementation of viame_tasks.tasks.run_pipeline
  *
- * @param datasetIdPath dataset path absolute
- * @param pipeline pipeline file basename
- * @param settings global settings
+ * @param runPipelineArgs args
+ * @param updater callback for logs
+ * @returns job
  */
 async function runPipeline(
   runPipelineArgs: RunPipeline,
@@ -60,8 +72,8 @@ async function runPipeline(
     throw new Error(isValid);
   }
 
-  const setupScriptPath = npath.join(settings.viamePath, 'setup_viame.sh');
-  const pipelinePath = npath.join(settings.viamePath, 'configs/pipelines', pipelineName);
+  const setupScriptPath = npath.join(settings.viamePath, SetupScriptName);
+  const pipelinePath = npath.join(settings.viamePath, PreTrainedPipelinesPath, pipelineName);
   const datasetInfo = await common.getDatasetBase(datasetId);
   const auxPath = await common.getAuxFolder(datasetInfo.basePath);
   const jobWorkDir = await common.createKwiverRunWorkingDir(
@@ -158,6 +170,57 @@ async function runPipeline(
       endTime: new Date(),
     });
   });
+
+  return jobBase;
+}
+
+/**
+ * Run training on dataset list.
+ * 
+ * New pipeline will be created at settings.dataPath/trainedPipes
+ * Training process working directory will be a regular common.createKwiverWorkingDir
+ * under the first dataset in the list.
+ *
+ * @param runTrainingArgs training arguments
+ * @param updater callback for logging and process updates
+ * @returns job
+ */
+async function runTraining(
+  runTrainingArgs: TrainPipeline,
+  updater: (msg: DesktopJobUpdate) => void,
+): Promise<DesktopJob> {
+  const { datasetIds, settings } = runTrainingArgs;
+  const newPipelineName = common.sanitizeUserInput(runTrainingArgs.newPipelineName);
+  if (datasetIds.length === 0) {
+    throw new Error('Must have at least 1 dataset to train on');
+  }
+
+  const isValid = await validateViamePath(settings);
+  if (isValid !== true) {
+    throw new Error(isValid);
+  }
+
+  const setupScriptPath = npath.join(settings.viamePath, SetupScriptName);
+
+  // For now, just use datasetIds[0] aux folder as job working directory
+  // TODO decide if this needs to change
+  const datasetInfo0 = await common.getDatasetBase(datasetIds[0]);
+  const auxPath0 = await common.getAuxFolder(datasetInfo0.basePath);
+  const jobWorkDir0 = await common.createKwiverRunWorkingDir(
+    datasetInfo0.name, auxPath0, newPipelineName,
+  );
+
+  const jobBase: DesktopJob = {
+    // key: `training_${job.pid}_${jobWorkDir}`,
+    key: `training_${jobWorkDir0}`,
+    jobType: 'training',
+    pid: 0, // TODO
+    pipelineName: newPipelineName,
+    workingDir: jobWorkDir0,
+    datasetIds,
+    exitCode: null,
+    startTime: new Date(),
+  };
 
   return jobBase;
 }

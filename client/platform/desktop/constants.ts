@@ -82,7 +82,21 @@ export interface DesktopJobUpdate extends DesktopJob {
 }
 
 export interface RunPipeline {
+  // datasetId path
   datasetId: string;
+  // pipelineName existing pipeline to run
   pipelineName: string;
+  // settings user settings
+  settings: Settings;
+}
+
+export interface TrainPipeline {
+  // datsetIds path string list
+  datasetIds: string[];
+  // newPipelineName name of new pipe to be created
+  newPipelineName: string;
+  // configName name of training configuration
+  configName: string;
+  // settings user settings
   settings: Settings;
 }

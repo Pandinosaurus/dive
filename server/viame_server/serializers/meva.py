@@ -1,12 +1,7 @@
-import csv
-import io
-import json
-import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional
 
-import yaml
-from boiler import models
+from boiler import models, BoilerError
 from boiler.definitions import ActorType
 from boiler.serialization import kpf
 from girder.models.file import File
@@ -19,7 +14,6 @@ class Detection:
     frame: int
     box: models.Box
     keyframe: bool = False
-
     geom_id: Optional[int] = None
     timestamp: Optional[float] = None
 

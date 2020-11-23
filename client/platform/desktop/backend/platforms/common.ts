@@ -23,6 +23,10 @@ const JobFolderName = 'job_runs';
 const JsonFileName = /^result(_.*)?\.json$/;
 const CsvFileName = /^.*\.csv$/;
 
+function sanitizeUserInput(str: string) {
+  return str.replace(/[\.\s/]+/g, '_');
+}
+
 async function getDatasetBase(datasetId: string): Promise<{
   datasetType: DatasetType;
   basePath: string;
@@ -183,8 +187,9 @@ async function createKwiverRunWorkingDir(datasetName: string, baseDir: string, p
   const jobFolderPath = npath.join(baseDir, JobFolderName);
   // eslint won't recognize \. as valid escape
   // eslint-disable-next-line no-useless-escape
-  const safeDatasetName = datasetName.replace(/[\.\s/]+/g, '_');
-  const runFolderName = moment().format(`[${safeDatasetName}_${pipeline}]_MM-DD-yy_hh-mm-ss`);
+  const safeDatasetName = sanitizeUserInput(datasetName);
+  const safePipeName = sanitizeUserInput(pipeline);
+  const runFolderName = moment().format(`[${safeDatasetName}_${safePipeName}]_MM-DD-yy_hh-mm-ss`);
   const runFolderPath = npath.join(jobFolderPath, runFolderName);
   if (!fs.existsSync(jobFolderPath)) {
     await fs.mkdir(jobFolderPath);
@@ -304,6 +309,7 @@ export default {
   getDatasetBase,
   getPipelineList,
   loadDetections,
+  sanitizeUserInput,
   saveDetections,
   postprocess,
 };
