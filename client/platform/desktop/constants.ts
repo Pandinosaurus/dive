@@ -15,6 +15,12 @@ export const websafeImageTypes = [
   // 'image/webp',
 ];
 
+export const validImageFormats = [
+  'tif', 'tiff', 'sgi', 'bmp', 'pgm',
+];
+export const validVideoFormats = ['mp4', 'avi', 'mov', 'mpg'];
+
+
 export const SettingsCurrentVersion = 1;
 export interface Settings {
   // version a schema version

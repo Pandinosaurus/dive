@@ -17,7 +17,7 @@ import common from '../backend/platforms/common';
 import {
   DesktopJob, NvidiaSmiReply, RunPipeline,
   websafeImageTypes, websafeVideoTypes,
-  DesktopDataset, Settings,
+  DesktopDataset, Settings, validVideoFormats,
 } from '../constants';
 
 const { loadDetections, saveDetections } = common;
@@ -33,6 +33,11 @@ function nvidiaSmi(): Promise<NvidiaSmiReply> {
 function openLink(url: string): Promise<void> {
   return ipcRenderer.invoke('open-link-in-browser', url);
 }
+
+function ffprobe(file: string): Promise<void> {
+  return ipcRenderer.invoke('ffprobe', file);
+}
+
 
 async function openFromDisk(datasetType: DatasetType) {
   let filters: FileFilter[] = [];
@@ -95,12 +100,16 @@ async function loadMetadata(datasetId: string): Promise<DesktopDataset> {
       basePath = path.dirname(datasetId); // parent directory of video;
       videoPath = abspath;
       videoUrl = abspathuri;
+      ffprobe(abspath);
     } else if (mimetype && websafeImageTypes.includes(mimetype)) {
       datasetType = 'image-sequence';
       imageData.push({
         url: abspathuri,
         filename: basename,
       });
+    } else if (validVideoFormats.includes(path.extname(abspath).replace('.', ''))) {
+      //Check to see if we can convert it
+      ffprobe(abspath);
     }
   }
 
@@ -164,4 +173,5 @@ export {
   openFromDisk,
   openLink,
   nvidiaSmi,
+  ffprobe,
 };

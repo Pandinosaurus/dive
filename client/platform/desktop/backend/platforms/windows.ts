@@ -2,7 +2,7 @@
  * VIAME process manager for windows platform
  */
 import npath from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { app } from 'electron';
 import fs from 'fs-extra';
 import { xml2json } from 'xml-js';
@@ -243,10 +243,26 @@ async function nvidiaSmi(): Promise<NvidiaSmiReply> {
     });
   });
 }
+
+async function ffprobeFile(file: string) {
+  const ffprobePath = `"${DefaultSettings.viamePath}\\in\\ffprobe.exe"`;
+  const result = spawnSync(ffprobePath,
+    ['-print_format',
+      'json',
+      '-v',
+      'quiet',
+      '-show_format',
+      '-show_streams',
+      file,
+    ]);
+  console.log(result);
+  return result;
+}
 export default {
   DefaultSettings,
   validateViamePath,
   runPipeline,
   nvidiaSmi,
   initialize,
+  ffprobeFile,
 };

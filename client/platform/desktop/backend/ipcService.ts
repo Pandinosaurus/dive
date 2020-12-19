@@ -35,6 +35,12 @@ export default function register() {
   if (OS.platform() === 'win32') {
     win32.initialize();
   }
+
+  ipcMain.handle('ffprobe', async (_, file: string) => {
+    const ret = await currentPlatform.ffprobeFile(file);
+    return ret;
+  });
+
   ipcMain.handle('nvidia-smi', async () => {
     const ret = await currentPlatform.nvidiaSmi();
     return ret;

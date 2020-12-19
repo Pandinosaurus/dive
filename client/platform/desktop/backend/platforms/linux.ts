@@ -2,9 +2,10 @@
  * VIAME process manager for linux platform
  */
 import npath from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs-extra';
 import { xml2json } from 'xml-js';
+
 
 import {
   Settings, SettingsCurrentVersion,
@@ -13,6 +14,7 @@ import {
 } from '../../constants';
 
 import common from './common';
+
 
 const DefaultSettings: Settings = {
   // The current settings schema config
@@ -192,10 +194,24 @@ async function nvidiaSmi(): Promise<NvidiaSmiReply> {
   });
 }
 
+async function ffprobeFile(file: string) {
+  const ffprobePath = `${DefaultSettings.viamePath}/bin/ffprobe`;
+  const result = spawnSync(ffprobePath,
+    ['-print_format',
+      'json',
+      '-v',
+      'quiet',
+      '-show_format',
+      '-show_streams',
+      file,
+    ]);
+  return result;
+}
 
 export default {
   DefaultSettings,
   validateViamePath,
   runPipeline,
   nvidiaSmi,
+  ffprobeFile,
 };
