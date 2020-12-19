@@ -65,7 +65,7 @@ export interface DesktopJob {
   // key unique identifier for this job
   key: string;
   // jobType identify type of job
-  jobType: 'pipeline' | 'training';
+  jobType: 'pipeline' | 'training' | 'convert';
   // pipelineName of the pipe or job being run
   pipelineName: string;
   // datasetIds of the involved datasets
@@ -91,4 +91,20 @@ export interface RunPipeline {
   datasetId: string;
   pipelineName: string;
   settings: Settings;
+}
+
+
+export interface FFProbeResults {
+  streams?: [{
+    codec_type?: string;
+    codec_name?: string;
+  }];
+}
+
+export interface ConvertFFMPEG {
+  convert: 'video' | 'image' | false;
+  datasetId: string;
+  basePath: string;
+  source?: string;
+  dest?: string;
 }

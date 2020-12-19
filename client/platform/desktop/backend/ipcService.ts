@@ -1,7 +1,7 @@
 import OS from 'os';
 
 import { ipcMain } from 'electron';
-import { DesktopJobUpdate, RunPipeline, Settings } from '../constants';
+import { ConvertFFMPEG, DesktopJobUpdate, RunPipeline, Settings } from '../constants';
 
 import server from './server';
 import linux from './platforms/linux';
@@ -40,6 +40,15 @@ export default function register() {
     const ret = await currentPlatform.ffprobeFile(file);
     return ret;
   });
+
+  ipcMain.handle('run-ffmpeg-convert', async (event, data: ConvertFFMPEG[]) => {
+    const updater = (update: DesktopJobUpdate) => {
+      event.sender.send('job-update', update);
+    };
+
+    return currentPlatform.ffmpegConvert(data, updater);
+  });
+
 
   ipcMain.handle('nvidia-smi', async () => {
     const ret = await currentPlatform.nvidiaSmi();

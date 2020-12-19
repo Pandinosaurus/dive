@@ -11,6 +11,7 @@ import {
   Settings, SettingsCurrentVersion,
   DesktopJob, DesktopJobUpdate, RunPipeline,
   NvidiaSmiReply,
+  ConvertFFMPEG,
 } from '../../constants';
 
 import common from './common';
@@ -205,7 +206,95 @@ async function ffprobeFile(file: string) {
       '-show_streams',
       file,
     ]);
-  return result;
+  if (result.error) {
+    throw result.error;
+  }
+  return JSON.parse((result.stdout.toString()));
+}
+
+
+async function ffmpegConvert(
+  convertData: ConvertFFMPEG[],
+  updater: (msg: DesktopJobUpdate) => void,
+): Promise<DesktopJob> {
+  const ffprobePath = `"${DefaultSettings.viamePath}/bin/ffmpeg"`;
+  const commands: string[] = [];
+
+
+  if (!convertData.length) {
+    throw new Error('Trying to convert empty data');
+  }
+
+  convertData.forEach((item) => {
+    if (item.convert === 'video') {
+      commands.push(`"${ffprobePath} -i ${item.source} -c:v libx264 -preset slow -crf 26 -c:a copy ${item.dest}`);
+    } else if (item.convert === 'image' && item.dest) {
+      commands.push(`"${ffprobePath} -i ${item.source} ${item.dest.replace(npath.extname(item.dest), '.png')}`);
+    }
+  });
+  const joblog = npath.join((convertData[0].dest ? convertData[0].dest : './'), 'runlog.txt');
+
+  console.log('executing');
+  console.log(commands.join(' && '));
+  const job = spawn(commands.join(' &&'), {
+    shell: true,
+    cwd: convertData[0].dest,
+  });
+
+  const jobBase: DesktopJob = {
+    key: `pipeline_${job.pid}_${convertData[0].dest}`,
+    jobType: 'convert',
+    pid: job.pid,
+    pipelineName: 'convert',
+    workingDir: convertData[0].dest || DefaultSettings.dataPath,
+    datasetIds: [convertData[0].datasetId],
+    exitCode: job.exitCode,
+    startTime: new Date(),
+  };
+
+  const processChunk = (chunk: Buffer) => chunk
+    .toString('utf-8')
+    .split('\n')
+    .filter((a) => a);
+
+  job.stdout.on('data', (chunk: Buffer) => {
+    // eslint-disable-next-line no-console
+    console.log(chunk.toString('utf-8'));
+    updater({
+      ...jobBase,
+      body: processChunk(chunk),
+    });
+    // No way in windows to display and log stdout at same time without 3rd party tools
+    fs.appendFile(joblog, chunk.toString('utf-8'), (err) => {
+      if (err) throw err;
+    });
+  });
+
+  job.stderr.on('data', (chunk: Buffer) => {
+    // eslint-disable-next-line no-console
+    console.log(chunk.toString('utf-8'));
+    updater({
+      ...jobBase,
+      body: processChunk(chunk),
+    });
+    fs.appendFile(joblog, chunk.toString('utf-8'), (err) => {
+      if (err) throw err;
+    });
+  });
+
+  job.on('exit', async (code) => {
+    if (code !== 0) {
+      console.error('Error with running conversion');
+    }
+    updater({
+      ...jobBase,
+      body: [''],
+      exitCode: code,
+      endTime: new Date(),
+    });
+  });
+
+  return jobBase;
 }
 
 export default {
@@ -214,4 +303,5 @@ export default {
   runPipeline,
   nvidiaSmi,
   ffprobeFile,
+  ffmpegConvert,
 };
