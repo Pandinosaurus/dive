@@ -279,7 +279,7 @@ async function ffmpegConvert(
     if (item.convert === 'video') {
       commands.push(`${ffprobePath} -i "${item.source}" -c:v libx264 -preset slow -crf 26 -c:a copy "${item.dest}"`);
     } else if (item.convert === 'image' && item.dest) {
-      commands.push(`${ffprobePath} -i "${item.source}" "${item.dest.replace(npath.extname(item.dest), '.png')}"`);
+      commands.push(`${ffprobePath} -i "${item.source}" "${item.dest}"`);
     }
   });
   const joblog = npath.join(convertData[0].basePath, 'runlog.txt');

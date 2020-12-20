@@ -12,6 +12,11 @@ export default function wrap(): Api {
   async function loadMetadata(datasetId: string) {
     const ds = await api.loadMetadata(datasetId);
     setDataset(datasetId, ds);
+    const job = await api.postProcessDataset(ds, datasetId);
+    if (job) {
+      const datasets = job.datasetIds.map(((id) => getDataset(id).value));
+      getOrCreateHistory(job, datasets);
+    }
     return ds.meta;
   }
 

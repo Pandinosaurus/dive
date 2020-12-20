@@ -17,7 +17,7 @@ import common from '../backend/platforms/common';
 import {
   DesktopJob, NvidiaSmiReply, RunPipeline,
   websafeImageTypes, websafeVideoTypes,
-  DesktopDataset, Settings, validVideoFormats, FFProbeResults, ConvertFFMPEG,
+  DesktopDataset, Settings, validVideoFormats, FFProbeResults, ConvertFFMPEG, validImageFormats,
 } from '../constants';
 
 const { loadDetections, saveDetections } = common;
@@ -97,7 +97,7 @@ async function loadMetadata(datasetId: string): Promise<DesktopDataset> {
   const serverInfo = await mediaServerInfo();
 
 
-  async function processFile(abspath: string): Promise<ConvertFFMPEG> {
+  function processFile(abspath: string) {
     const basename = path.basename(abspath);
     const abspathuri = `http://localhost:${serverInfo.port}/api/media?path=${abspath}`;
     const mimetype = mime.lookup(abspath);
@@ -106,64 +106,31 @@ async function loadMetadata(datasetId: string): Promise<DesktopDataset> {
       basePath = path.dirname(datasetId); // parent directory of video;
       videoPath = abspath;
       videoUrl = abspathuri;
-    } if (mimetype && websafeImageTypes.includes(mimetype)) {
+    } else if (mimetype && websafeImageTypes.includes(mimetype)) {
       datasetType = 'image-sequence';
       imageData.push({
         url: abspathuri,
         filename: basename,
       });
-      return { convert: false, datasetId, basePath };
-    } if (validVideoFormats.includes(path.extname(abspath).replace('.', ''))) {
-      //Check to see if we can convert it
-      datasetType = 'video';
+    } else if (validImageFormats.includes(path.extname(abspath))) {
+      datasetType = 'image-sequence';
+      imageData.push({
+        url: abspathuri,
+        filename: basename,
+      });
     }
-    if (datasetType === 'video') {
-      const ffprobeJSON = await ffprobe(abspath);
-      if (ffprobeJSON && ffprobeJSON.streams) {
-        const websafe = ffprobeJSON.streams.filter((el) => el.codec_name === 'h264' && el.codec_type === 'video');
-        if (websafe.length) {
-          //TODO: update the videoPath to the project location here depending on the looping
-          return {
-            convert: 'video',
-            datasetId,
-            basePath,
-            source: abspath,
-            dest: abspath.replace(path.extname(abspath), '_converted.mp4'),
-          };
-        }
-      }
-    }
-    return { convert: false, datasetId, basePath };
   }
 
   const info = await fs.stat(datasetId);
 
-  let possibleConverts: ConvertFFMPEG[] = [];
   if (info.isDirectory()) {
     const contents = await fs.readdir(datasetId);
-    const fileList = [];
     for (let i = 0; i < contents.length; i += 1) {
-      fileList.push(path.join(datasetId, contents[i]));
+      processFile(path.join(datasetId, contents[i]));
     }
-    possibleConverts = await Promise.all(fileList.map(processFile));
   } else {
-    const singleFile = await processFile(datasetId);
-    possibleConverts.push(singleFile);
+    processFile(datasetId);
   }
-  console.log(possibleConverts);
-  // Now we need to see what needs to be converted and update
-  // the corresponding file location and kick off the jobs
-  const imageFiles = possibleConverts.filter((item) => item.convert !== false && item.convert === 'image');
-  const videoFiles = possibleConverts.filter((item) => item.convert !== false && item.convert === 'video');
-  //We batch the images into a single job, we handle videoFiles individually
-
-  if (videoFiles.length) {
-    videoFiles.forEach((item) => ipcRenderer.invoke('run-ffmpeg-convert', [item]));
-  }
-  if (imageFiles.length) {
-    ipcRenderer.invoke('run-ffmpeg-conver', imageFiles);
-  }
-
 
   if (datasetType === undefined) {
     throw new Error(`Cannot open dataset ${datasetId}: No images or video found`);
@@ -180,6 +147,55 @@ async function loadMetadata(datasetId: string): Promise<DesktopDataset> {
       videoUrl: datasetType === 'video' ? videoUrl : undefined,
     },
   });
+}
+
+async function postProcessDataset(
+  dataset: DesktopDataset, datasetId: string,
+): Promise<false | DesktopJob> {
+  const datasetType = dataset.meta.type;
+  const { basePath } = dataset;
+  if (datasetType === 'video') {
+    const abspath = dataset.videoPath;
+    if (basePath && abspath && validVideoFormats.includes(path.extname(abspath))) {
+      const ffprobeJSON = await ffprobe(abspath);
+      if (ffprobeJSON && ffprobeJSON.streams) {
+        console.log(ffprobeJSON);
+        const websafe = ffprobeJSON.streams.filter((el) => el.codec_name === 'h264' && el.codec_type === 'video');
+        if (!websafe.length || true) {
+        //TODO: update the videoPath to the project location here depending on the looping
+          const job: DesktopJob = await ipcRenderer.invoke('run-ffmpeg-convert', [{
+            convert: 'video',
+            datasetId,
+            basePath,
+            source: abspath,
+            dest: abspath.replace(path.extname(abspath), '_converted.mp4'),
+          }]);
+          return job;
+        }
+      }
+    }
+  } else if (datasetType === 'image-sequence') {
+    const images = dataset.meta.imageData;
+    const serverInfo = await mediaServerInfo();
+    const convertList: ConvertFFMPEG[] = [];
+    images.forEach((image) => {
+      if (validImageFormats.includes(path.extname(image.filename))) {
+        const abspath = image.url.replace(`http://localhost:${serverInfo.port}/api/media?path=`, '');
+        convertList.push({
+          convert: 'image',
+          datasetId,
+          basePath,
+          source: abspath,
+          dest: abspath.replace(path.extname(abspath), '_converted.png'),
+        });
+      }
+    });
+    if (convertList.length) {
+      const job: DesktopJob = await ipcRenderer.invoke('run-ffmpeg-convert', convertList);
+      return job;
+    }
+  }
+  return false;
 }
 
 // eslint-disable-next-line
@@ -215,4 +231,6 @@ export {
   openLink,
   nvidiaSmi,
   ffprobe,
+  ffmpegConvert,
+  postProcessDataset,
 };

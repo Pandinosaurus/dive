@@ -1,7 +1,9 @@
 import OS from 'os';
 
 import { ipcMain } from 'electron';
-import { ConvertFFMPEG, DesktopJobUpdate, RunPipeline, Settings } from '../constants';
+import {
+  ConvertFFMPEG, DesktopJobUpdate, RunPipeline, Settings,
+} from '../constants';
 
 import server from './server';
 import linux from './platforms/linux';

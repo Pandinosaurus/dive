@@ -16,9 +16,9 @@ export const websafeImageTypes = [
 ];
 
 export const validImageFormats = [
-  'tif', 'tiff', 'sgi', 'bmp', 'pgm',
+  '.tif', '.tiff', '.sgi', '.bmp', '.pgm',
 ];
-export const validVideoFormats = ['mp4', 'avi', 'mov', 'mpg'];
+export const validVideoFormats = ['.mp4', '.avi', '.mov', '.mpg'];
 
 
 export const SettingsCurrentVersion = 1;
