@@ -1,14 +1,14 @@
 import Vue from 'vue';
 import Vuetify from 'vuetify/lib';
 import colors from 'vuetify/lib/util/colors';
-import girderVuetifyConfig from '@girder/components/src/utils/vuetifyConfig';
+import { utils } from '@girder/components';
 import { merge } from 'lodash';
 
 import '@mdi/font/css/materialdesignicons.css';
 
 Vue.use(Vuetify);
 
-const appVuetifyConfig = merge(girderVuetifyConfig, {
+const appVuetifyConfig = merge(utils.vuetifyConfig, {
   theme: {
     dark: true,
     options: {

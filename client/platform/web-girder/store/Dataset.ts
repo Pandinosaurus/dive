@@ -1,4 +1,4 @@
-import { GirderModel } from '@girder/components/src';
+import type { GirderModel } from '@girder/components';
 import { Module } from 'vuex';
 
 import { ImageSequenceType, VideoType } from 'viame-web-common/constants';

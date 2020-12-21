@@ -1,6 +1,7 @@
 <script>
+import Vue from 'vue';
 import Dropzone from '@girder/components/src/components/Presentation/Dropzone.vue';
-import { fileUploader, sizeFormatter } from '@girder/components/src/utils/mixins';
+import { mixins } from '@girder/components';
 import { ImageSequenceType, VideoType } from 'viame-web-common/constants';
 
 import { makeViameFolder, validateUploadGroup, postProcess } from '../api/viame.service';
@@ -55,10 +56,10 @@ async function readFilesFromDrop(e) {
   ];
 }
 
-export default {
+export default Vue.extend({
   name: 'Upload',
   components: { Dropzone },
-  mixins: [fileUploader, sizeFormatter],
+  mixins: [mixins.fileUploader, mixins.sizeFormatter],
   inject: ['girderRest'],
   props: {
     location: {
@@ -277,7 +278,7 @@ export default {
       });
     },
   },
-};
+});
 </script>
 
 <template>

@@ -1,5 +1,6 @@
 <script>
 import { mapState } from 'vuex';
+// eslint-disable-next-line import/no-unresolved, import/extensions
 import { all } from '@girder/components/src/components/Job/status';
 
 import NavigationTitle from 'viame-web-common/components/NavigationTitle.vue';

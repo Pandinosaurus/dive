@@ -1,7 +1,7 @@
 <script>
+import Vue from 'vue';
 import { mapMutations } from 'vuex';
-import { FileManager } from '@girder/components/src/components/Snippet';
-import { getLocationType } from '@girder/components/src/utils';
+import { snippets, utils as gwcUtils } from '@girder/components';
 
 import RunPipelineMenu from 'viame-web-common/components/RunPipelineMenu.vue';
 import RunTrainingMenu from 'viame-web-common/components/RunTrainingMenu.vue';
@@ -12,7 +12,9 @@ import Export from './Export.vue';
 import NavigationBar from './NavigationBar.vue';
 import Upload from './Upload.vue';
 
-export default {
+const { FileManager } = snippets;
+
+export default Vue.extend({
   name: 'Home',
   components: {
     Export,
@@ -53,7 +55,7 @@ export default {
       return (
         this.location
         && !this.locationIsViameFolder
-        && getLocationType(this.location) === 'folder'
+        && gwcUtils.getLocationType(this.location) === 'folder'
         && !this.selected.length
       );
     },
@@ -141,7 +143,7 @@ export default {
       }
     },
   },
-};
+});
 </script>
 
 <template>

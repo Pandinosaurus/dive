@@ -1,7 +1,8 @@
 <script>
-import JobList from '@girder/components/src/components/Job/JobList.vue';
-
+import { components } from '@girder/components';
 import NavigationBar from './NavigationBar.vue';
+
+const { JobList } = components;
 
 export default {
   name: 'Jobs',

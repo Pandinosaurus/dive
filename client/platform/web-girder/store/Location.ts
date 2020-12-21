@@ -1,5 +1,5 @@
 import { Module } from 'vuex';
-import { GirderModel } from '@girder/components/src';
+import type { GirderModel } from '@girder/components';
 
 export interface LocationState {
     location: null | GirderModel;

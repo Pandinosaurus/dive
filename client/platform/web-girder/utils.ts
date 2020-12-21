@@ -1,8 +1,5 @@
-import { AxiosError } from 'axios';
-import { GirderModel } from '@girder/components/src';
-// eslint-disable-next-line @typescript-eslint/ban-ts-ignore
-// @ts-ignore
-import { isRootLocation } from '@girder/components/src/utils/locationHelpers';
+import type { AxiosError } from 'axios';
+import { GirderModel, utils as gwcUtils } from '@girder/components';
 import { getFolder } from './api/girder.service';
 
 interface Location {
@@ -12,7 +9,7 @@ interface Location {
 }
 
 async function getLocationFromRoute({ params }: { params: GirderModel }) {
-  if (isRootLocation(params)) {
+  if (gwcUtils.isRootLocation(params)) {
     return {
       type: params._modelType,
     };

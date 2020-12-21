@@ -1,7 +1,7 @@
 import Vue from 'vue';
 import VueGtag from 'vue-gtag';
 import VueCompositionApi from '@vue/composition-api';
-import NotificationBus from '@girder/components/src/utils/notifications';
+import { utils as gwcUtils } from '@girder/components';
 import { init as SentryInit } from '@sentry/browser';
 import { Vue as SentryVue } from '@sentry/integrations';
 
@@ -33,7 +33,7 @@ SentryInit({
   release: process.env.VUE_APP_GIT_HASH,
 });
 
-const notificationBus = new NotificationBus(girderRest);
+const notificationBus = new gwcUtils.NotificationBus(girderRest, { useEventSource: true });
 notificationBus.connect();
 
 girderRest.fetchUser().then(() => {

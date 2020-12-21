@@ -1,4 +1,4 @@
-import { GirderModel } from '@girder/components/src';
+import type { GirderModel } from '@girder/components';
 import {
   Attribute, Pipe, Pipelines, TrainingConfigs,
 } from 'viame-web-common/apispec';

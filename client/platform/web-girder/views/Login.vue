@@ -2,13 +2,13 @@
 import {
   defineComponent, reactive, toRefs, onBeforeUnmount,
 } from '@vue/composition-api';
-import { Authentication as GirderAuth } from '@girder/components/src/components';
+import { components } from '@girder/components';
 import { useGirderRest } from '../plugins/girder';
 
 export default defineComponent({
   name: 'Login',
   components: {
-    GirderAuth,
+    GirderAuth: components.Authentication,
   },
   setup(_, { root }) {
     const data = reactive({

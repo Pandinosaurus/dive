@@ -1,5 +1,5 @@
 import Vue from 'vue';
-import Girder, { RestClient } from '@girder/components/src';
+import Girder, { RestClient } from '@girder/components';
 
 Vue.use(Girder);
 const girderRest = new RestClient({ apiRoot: 'api/v1' });
