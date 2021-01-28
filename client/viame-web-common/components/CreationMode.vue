@@ -27,7 +27,7 @@ export default Vue.extend({
       type: 'Choose a default type for the new Track/Detection to be or type in a new type to add it',
       autoAdvanceFrame: 'After creating a track advance to the next frame.  Hit Esc or do single click to exit.',
       interpolate: 'Whether new tracks should have interpolation enabled by default',
-      continuous: 'Immediately stay in detection creation mode after creating a new track.  Hit Esc or do single click to exit.',
+      continuous: 'Immediately stay in detection creation mode after creating a new track.  Hit Esc to exit.',
     },
     modes: ['Track', 'Detection'],
   }),
