@@ -2,6 +2,8 @@
 import Vue, { PropType } from 'vue';
 
 export default Vue.extend({
+  name: 'TooltipButton',
+
   props: {
     icon: {
       type: String as PropType<string>,
@@ -19,6 +21,22 @@ export default Vue.extend({
       type: String as PropType<string>,
       default: undefined,
     },
+    delay: {
+      type: Number,
+      default: 600,
+    },
+    size: {
+      type: String,
+      default: 'small',
+    },
+    outlined: {
+      type: Boolean,
+      default: false,
+    },
+    tile: {
+      type: Boolean,
+      default: false,
+    },
   },
 });
 </script>
@@ -26,19 +44,25 @@ export default Vue.extend({
 <template>
   <v-tooltip
     bottom
-    open-delay="600"
+    :open-delay="delay"
   >
     <template #activator="{ on, attrs }">
       <v-btn
         v-bind="attrs"
-        small
+        :small="size === 'small'"
+        :x-small="size === 'x-small'"
         icon
         :disabled="disabled"
         :color="color"
+        :outlined="outlined"
+        :tile="tile"
+        class="ma-0"
         v-on="on"
-        @click="$emit('click')"
+        @click="$emit('click', $event)"
       >
-        <v-icon>{{ icon }}</v-icon>
+        <v-icon>
+          {{ icon }}
+        </v-icon>
       </v-btn>
     </template>
     <span>{{ tooltipText }}</span>

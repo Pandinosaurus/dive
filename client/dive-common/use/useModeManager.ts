@@ -1,18 +1,76 @@
 import {
   computed, Ref, reactive, ref, onBeforeUnmount, toRef,
-} from '@vue/composition-api';
-import { uniq, flatMapDeep } from 'lodash';
-import Track, { TrackId } from 'vue-media-annotator/track';
-import { getTrack } from 'vue-media-annotator/use/useTrackStore';
-import { RectBounds, updateBounds } from 'vue-media-annotator/utils';
+} from 'vue';
+import {
+  cloneDeep, uniq, flatMapDeep, flattenDeep,
+} from 'lodash';
+import Track, { Feature, TrackId, TrackSupportedFeature } from 'vue-media-annotator/track';
+import {
+  RectBounds,
+  updateBounds,
+  validateRotation,
+  getRotationFromAttributes,
+  hasSignificantRotation,
+  polygonWithinBounds,
+  polygonEqualsBounds,
+  translatePolygon,
+  isBoundsTranslation,
+  clipPolygonToBounds,
+  ROTATION_ATTRIBUTE_NAME,
+} from 'vue-media-annotator/utils';
+import type AlignedViewStore from 'vue-media-annotator/alignedView/AlignedViewStore';
+import {
+  mapBounds, mapRotatedBounds, mapGeoJSONFeatures,
+} from 'vue-media-annotator/alignedView/alignedView';
 import { EditAnnotationTypes, VisibleAnnotationTypes } from 'vue-media-annotator/layers';
-import { MediaController } from 'vue-media-annotator/components/annotators/mediaControllerType';
+import { AggregateMediaController } from 'vue-media-annotator/components/annotators/mediaControllerType';
 
 import Recipe from 'vue-media-annotator/recipe';
+import type { AnnotationId } from 'vue-media-annotator/BaseAnnotation';
+import type TrackFilterControls from 'vue-media-annotator/TrackFilterControls';
+
 import { usePrompt } from 'dive-common/vue-utilities/prompt-service';
-import { clientSettings } from 'dive-common/store/settings';
+import { clientSettings, isStereoInteractiveModeEnabled } from 'dive-common/store/settings';
+import type { SegmentationPolygon } from 'dive-common/apispec';
+import GroupFilterControls from 'vue-media-annotator/GroupFilterControls';
+import CameraStore from 'vue-media-annotator/CameraStore';
+import { SortedAnnotation } from 'vue-media-annotator/BaseAnnotationStore';
+import SegmentationPointClick, {
+  SegmentationPolygonKey,
+  SegmentationPredictionResult,
+  MultiFrameSegmentationResult,
+} from 'dive-common/recipes/segmentationpointclick';
+import {
+  componentsBounds, isSegmentationPolygonKey, segmentationComponents, segmentationPolygonFeatures,
+} from 'dive-common/recipes/segmentationPolygons';
+import { linePointEdit } from './stereo/keypointTransfer';
 
 type SupportedFeature = GeoJSON.Feature<GeoJSON.Point | GeoJSON.Polygon | GeoJSON.LineString>;
+
+/* default to index + 1
+ * call with -1 to select previous, or pass any other delta
+ */
+function selectNext<T extends SortedAnnotation<T>>(
+  filtered: readonly T[],
+  selected: Readonly<AnnotationId | null>,
+  delta = 1,
+): AnnotationId | null {
+  if (filtered.length > 0) {
+    if (selected === null) {
+      // if no track is selected, return the first trackId
+      return filtered[0].id;
+    }
+    // return the trackId by the delta offset if it exists
+    const index = filtered.findIndex((t) => t.id === selected);
+    const newIndex = index + delta;
+    if (newIndex >= 0 && newIndex < filtered.length) {
+      // if we are not at the end
+      return filtered[newIndex].id;
+    }
+  }
+  //Return null if no other conditions are met
+  return null;
+}
 
 interface SetAnnotationStateArgs {
   visible?: VisibleAnnotationTypes[];
@@ -20,6 +78,40 @@ interface SetAnnotationStateArgs {
   key?: string;
   recipeName?: string;
 }
+
+export type NewAnnotationGeometryParams = {
+  camera: string;
+  trackId: number;
+  frameNum: number;
+} & (
+  | { source: 'box'; bounds: [number, number, number, number] }
+  | { source: 'line'; line: [number, number][] }
+  | { source: 'points'; points: [number, number][] }
+  | { source: 'mask'; polygons: SegmentationPolygon[] }
+);
+
+export type StereoAnnotationCompleteParams =
+  | { type: 'point'; camera: string; trackId: number; frameNum: number; point: [number, number]; key: string; insert?: boolean; }
+  | { type: 'line'; camera: string; trackId: number; frameNum: number;
+      line: [number, number][]; key: string; }
+  | { type: 'box'; camera: string; trackId: number; frameNum: number;
+      bounds: [number, number, number, number]; }
+  | { type: 'polygon'; camera: string; trackId: number; frameNum: number;
+      polygon: [number, number][]; key: string; }
+  | { type: 'segmentation'; camera: string; trackId: number; frameNum: number;
+      points: [number, number][]; labels: number[]; };
+
+export type StereoAnnotationResetParams = {
+  trackId: number;
+  frameNum: number;
+  sourceCamera: string;
+};
+
+export type StereoSegmentationFinalizeParams = {
+  trackId: number;
+  frameNums: number[];
+};
+
 /**
  * The point of this composition function is to define and manage the transition betwee
  * different UI states within the program.  States and state transitions can be modified
@@ -28,43 +120,191 @@ interface SetAnnotationStateArgs {
  * Mostly allows us to inject additional logic into transitions.
  */
 export default function useModeManager({
-  selectedTrackId,
-  editingTrack,
-  trackMap,
-  mediaController,
+  cameraStore,
+  trackFilterControls,
+  groupFilterControls,
+  aggregateController,
+  readonlyState,
   recipes,
-  selectTrack,
-  selectNextTrack,
-  addTrack,
-  removeTrack,
+  alignedView,
+  isStereoscopicDataset,
+  lassoModeActive,
+  lassoDrawing,
+  onStereoAnnotationComplete,
+  onStereoAnnotationReset,
+  onNewAnnotationGeometry,
+  onStereoSegmentationFinalize,
 }: {
-  selectedTrackId: Ref<TrackId | null>;
-  editingTrack: Ref<boolean>;
-  trackMap: Map<TrackId, Track>;
-  mediaController: Ref<MediaController>;
-  recipes: Recipe[];
-  selectTrack: (trackId: TrackId | null, edit: boolean) => void;
-  selectNextTrack: (delta?: number) => TrackId | null;
-  addTrack: (frame: number, defaultType: string, afterId?: TrackId) => Track;
-  removeTrack: (trackId: TrackId) => void;
+    cameraStore: CameraStore;
+    trackFilterControls: TrackFilterControls;
+    groupFilterControls: GroupFilterControls;
+    aggregateController: Ref<AggregateMediaController>;
+    readonlyState: Readonly<Ref<boolean>>;
+    recipes: Recipe[];
+    /**
+     * When provided, geometry drawn/edited while the Align View is active is
+     * mirrored onto every other aligned camera (see
+     * {@link mirrorFeatureToAlignedCameras}).
+     */
+    alignedView?: AlignedViewStore;
+    /** When set, interactive stereo only runs on stereoscopic datasets. */
+    isStereoscopicDataset?: Ref<boolean>;
+    /** Alt-held lasso mode — keep in sync with EditorMenu tool disabling. */
+    lassoModeActive?: Readonly<Ref<boolean>>;
+    lassoDrawing?: Readonly<Ref<boolean>>;
+    onStereoAnnotationComplete?: (params: StereoAnnotationCompleteParams) => void;
+    onStereoAnnotationReset?: (params: StereoAnnotationResetParams) => void;
+    /**
+     * A detection just got its first shape on this frame (a newly drawn box,
+     * or a newly completed line). Fires per frame, not only for a brand-new track.
+     */
+    onNewAnnotationGeometry?: (params: NewAnnotationGeometryParams) => void;
+    onStereoSegmentationFinalize?: (params?: StereoSegmentationFinalizeParams) => void;
 }) {
   let creating = false;
+  const { prompt } = usePrompt();
 
+  function stereoInteractiveActive(): boolean {
+    return isStereoInteractiveModeEnabled()
+      && (isStereoscopicDataset === undefined || isStereoscopicDataset.value);
+  }
   const annotationModes = reactive({
     visible: ['rectangle', 'Polygon', 'LineString', 'text'] as VisibleAnnotationTypes[],
     editing: 'rectangle' as EditAnnotationTypes,
   });
   const trackSettings = toRef(clientSettings, 'trackSettings');
+  const groupSettings = toRef(clientSettings, 'groupSettings');
+  const selectedCamera = ref('singleCam');
 
-  // selectedFeatureHandle could arguably belong in useTrackSelectionControls,
-  // but the meaning of this value varies based on the editing mode.  When in
+  /**
+   * The currently selected camera's own local frame number. Under an aligned
+   * timeline (SEAL feature 5), aggregateController.value.frame is the global
+   * slot index, which diverges from any camera's local frame -- but tracks
+   * are stored/keyed by local frame. Every read/write below that keys track
+   * storage for selectedCamera must go through this, not aggregateController
+   * directly. See LayerManager.vue and Viewer.vue's isCreatingNewDetection
+   * for the identical pattern elsewhere.
+   */
+  function selectedCameraFrame(): number {
+    try {
+      return aggregateController.value.getController(selectedCamera.value).frame.value;
+    } catch {
+      // No controller registered for the selected camera (e.g. its annotator
+      // hasn't mounted yet during load/reload); fall back to the aggregate
+      // frame rather than throwing.
+      return aggregateController.value.frame.value;
+    }
+  }
+
+  const linkingState = ref(false);
+  const linkingTrack: Ref<AnnotationId| null> = ref(null);
+  const linkingCamera = ref('');
+
+  // Meaning of this value varies based on the editing mode.  When in
   // polygon edit mode, this corresponds to a polygon point.  Ditto in line mode.
   const selectedFeatureHandle = ref(-1);
   //The Key of the selected type, for now mostly ''
   const selectedKey = ref('');
+
+  // the currently selected Track
+  const selectedTrackId = ref(null as AnnotationId | null);
+
+  // the currently editing Group
+  const editingGroupId = ref(null as AnnotationId | null);
+
+  // boolean whether or not selectedTrackId is also being edited.
+  const editingTrack = ref(false);
+
+  // boolean denoting whether or not multiple tracks are selected for delete/edit
+  const editingMultiTrack = ref(false);
+
   // which type is currently being edited, if any
   const editingMode = computed(() => editingTrack.value && annotationModes.editing);
   const editingCanary = ref(false);
+
+  /**
+   * Callback that the LayerManager registers to finalize in-progress shapes
+   * (e.g., an incomplete polygon) before switching tracks or creating new ones.
+   */
+  let finalizeCreationCallback: (() => void) | null = null;
+
+  // Track Multi-select state
+  const multiSelectList = ref([] as AnnotationId[]);
+  const multiSelectActive = computed(() => multiSelectList.value.length > 0);
+
+  const _filteredTracks = computed(
+    () => trackFilterControls.filteredAnnotations.value.map((filtered) => filtered.annotation),
+  );
+
+  const _filteredGroups = computed(
+    () => groupFilterControls.filteredAnnotations.value.map((filtered) => filtered.annotation),
+  );
+
+  const selectNextTrack = (delta = 1) => selectNext(_filteredTracks.value, selectedTrackId.value, delta);
+
+  const selectNextGroup = (delta = 1) => selectNext(_filteredGroups.value, editingGroupId.value, delta);
+
+  /**
+   * Remove a track if it has no features (empty detection with nothing drawn).
+   * Returns true if the track was removed.
+   */
+  function _removeIfEmpty(checkTrackId: AnnotationId): boolean {
+    const track = cameraStore.getPossibleTrack(checkTrackId, selectedCamera.value);
+    // featureIndex is empty for never-drawn detections and for tracks whose
+    // last keyframe was deleted (begin/end become Infinity,0 — begin === end
+    // is false there, so a bounds-only check would leave ghosts in the list).
+    if (track && track.featureIndex.length === 0) {
+      const trackStore = cameraStore.camMap.value.get(selectedCamera.value)?.trackStore;
+      if (trackStore) {
+        trackStore.remove(checkTrackId);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // The right mousedown that selects a detection for point segmentation is
+  // followed on Windows by its contextmenu only after mouseup, once edit mode
+  // has begun. That contextmenu must not finalize the fresh edit, while a
+  // later right-click with no points placed still does, so remember which
+  // press entered edit mode.
+  let mouseDownCount = 0;
+  let editEnteredOnMouseDown = -1;
+  const countMouseDown = () => { mouseDownCount += 1; };
+  if (typeof document !== 'undefined') document.addEventListener('mousedown', countMouseDown, true);
+
+  function selectTrack(trackId: AnnotationId | null, edit = false) {
+    // Reset segmentation recipe state when switching to a different track
+    // so stale points/mask from the previous detection don't interfere. This
+    // is not a user reset (see handleConfirmRecipe).
+    if (trackId !== selectedTrackId.value) {
+      recipes.forEach((r) => {
+        if (r instanceof SegmentationPointClick && r.active.value) {
+          r.resetPoints(false);
+        }
+      });
+    }
+    if (trackId !== null && edit && (trackId !== selectedTrackId.value || !editingTrack.value)) {
+      editEnteredOnMouseDown = mouseDownCount;
+    }
+    // Clean up empty tracks when leaving edit mode (e.g., created a detection
+    // but never drew an annotation, then clicked away or right-clicked to deselect)
+    if (
+      selectedTrackId.value !== null
+      && editingTrack.value
+      && selectedTrackId.value !== trackId
+    ) {
+      _removeIfEmpty(selectedTrackId.value);
+    }
+    selectedTrackId.value = trackId;
+    if (edit && readonlyState.value) {
+      prompt({ title: 'Read Only Mode', text: 'This Dataset is in Read Only mode, no edits can be made.' });
+    } else {
+      editingTrack.value = trackId !== null && edit;
+    }
+  }
+
+  /** end  */
   function _depend(): boolean {
     return editingCanary.value;
   }
@@ -76,19 +316,29 @@ export default function useModeManager({
   const editingDetails = computed(() => {
     _depend();
     if (editingMode.value && selectedTrackId.value !== null) {
-      const { frame } = mediaController.value;
-      const track = trackMap.get(selectedTrackId.value);
-      if (track) {
-        const [feature] = track.getFeature(frame.value);
-        if (feature) {
-          if (!feature?.bounds?.length) {
-            return 'Creating';
-          } if (annotationModes.editing === 'rectangle') {
-            return 'Editing';
+      const frame = selectedCameraFrame();
+      try {
+        const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+        if (track) {
+          const [feature] = track.getFeature(frame);
+          if (feature) {
+            if (!feature?.bounds?.length) {
+              return 'Creating';
+            } if (annotationModes.editing === 'rectangle') {
+              return 'Editing';
+            }
+            // Check if there's a geometry matching both the type AND the selectedKey
+            const matchingGeometry = feature.geometry?.features.filter(
+              (item) => item.geometry.type === annotationModes.editing
+                && item.properties?.key === selectedKey.value,
+            );
+            return (matchingGeometry?.length ? 'Editing' : 'Creating');
           }
-          return (feature.geometry?.features.filter((item) => item.geometry.type === annotationModes.editing).length ? 'Editing' : 'Creating');
+          return 'Creating';
         }
-        return 'Creating';
+      } catch {
+      // No Track for this camera
+        return 'disabled';
       }
     }
     return 'disabled';
@@ -97,11 +347,7 @@ export default function useModeManager({
   const visibleModes = computed(() => (
     uniq(annotationModes.visible.concat(editingMode.value || []))
   ));
-  // Track merge state
-  const mergeList = ref([] as TrackId[]);
-  const mergeInProgress = computed(() => mergeList.value.length > 0);
 
-  const { prompt } = usePrompt();
   /**
    * Figure out if a new feature should enable interpolation
    * based on current state and the result of canInterolate.
@@ -119,13 +365,45 @@ export default function useModeManager({
       : interpolateTrack;
   }
 
-  function seekNearest(track: Track) {
-    // Seek to the nearest point in the track.
-    const { frame } = mediaController.value;
-    if (frame.value < track.begin) {
-      mediaController.value.seek(track.begin);
-    } else if (frame.value > track.end) {
-      mediaController.value.seek(track.end);
+  function seekNearest(track: Readonly<Pick<Track, 'begin' | 'end'>>) {
+    // Seek to the nearest point in the track. Compares/seeks using
+    // selectedCamera's own local frame (see selectedCameraFrame) rather than
+    // aggregateController.frame directly -- under an aligned timeline (SEAL
+    // feature 5) that's the global slot index, a different number space than
+    // track.begin/end. seekCameraFrame translates back through the timeline
+    // so every camera stays aligned; it's a no-op passthrough when alignment
+    // isn't active.
+    const frame = selectedCameraFrame();
+    if (frame < track.begin) {
+      aggregateController.value.seekCameraFrame(selectedCamera.value, track.begin);
+    } else if (frame > track.end) {
+      aggregateController.value.seekCameraFrame(selectedCamera.value, track.end);
+    }
+  }
+
+  // frame is selectedCamera's own local frame (e.g. FilterList.vue's
+  // "jump to peak frame" derives it from selectedCamera's own trackStore) --
+  // route through seekCameraFrame so this still lands correctly under an
+  // aligned timeline (SEAL feature 5), where local and global frame numbers
+  // can diverge.
+  function seekFrame(frame: number) {
+    aggregateController.value.seekCameraFrame(selectedCamera.value, frame);
+  }
+
+  async function _setLinkingTrack(trackId: TrackId) {
+    //Confirm that there is no track for other cameras.
+    const trackList = cameraStore.getTrackAll(trackId);
+    if (trackList.length > 1) {
+      prompt({
+        title: 'Linking Error',
+        text: [`TrackId: ${trackId} has tracks on other cameras besides the selected camera ${linkingCamera.value}`,
+          `You need to select a track that only exists on camera: ${linkingCamera.value} `,
+          'You can split of the track you were trying to select by clicking OK and hitting Escape to exit Linking Mode and using the split tool',
+        ],
+        positiveButton: 'OK',
+      });
+    } else {
+      linkingTrack.value = trackId;
     }
   }
 
@@ -146,7 +424,32 @@ export default function useModeManager({
     _selectKey(key);
   }
 
-  function handleSelectTrack(trackId: TrackId | null, edit = false) {
+  function handleLassoSelect(
+    trackIds: AnnotationId[],
+    modifiers: { ctrl: boolean } = { ctrl: false },
+  ) {
+    if (creating || trackIds.length === 0) {
+      return;
+    }
+    creating = false;
+    if (modifiers?.ctrl) {
+      const selected = new Set(multiSelectList.value);
+      trackIds.forEach((id) => selected.add(id));
+      multiSelectList.value = Array.from(selected);
+    } else {
+      multiSelectList.value = [...trackIds];
+    }
+    editingMultiTrack.value = true;
+    selectedTrackId.value = null;
+    editingTrack.value = false;
+    editingGroupId.value = null;
+  }
+
+  function handleSelectTrack(
+    trackId: AnnotationId | null,
+    edit = false,
+    modifiers: { ctrl: boolean } = { ctrl: false },
+  ) {
     /**
      * If creating mode and editing and selectedTrackId is the same,
      * don't kick out of creating mode.  This happens when moving between
@@ -155,48 +458,141 @@ export default function useModeManager({
     if (!(creating && edit && trackId === selectedTrackId.value)) {
       creating = false;
     }
+
+    if (!modifiers?.ctrl && editingMultiTrack.value) {
+      editingMultiTrack.value = false;
+      multiSelectList.value = [];
+    }
+
+    if (trackId !== null && !edit && !creating && modifiers?.ctrl) {
+      const selected = new Set(multiSelectList.value);
+      if (selected.has(trackId) && editingMultiTrack.value) {
+        // If ctrl + click on an already-selected track, remove that track from the list.
+        selected.delete(trackId);
+        multiSelectList.value = Array.from(selected);
+      } else if (selectedTrackId.value === null) {
+        multiSelectList.value = Array.from(selected.add(trackId));
+      } else {
+        multiSelectList.value = Array.from((new Set([selectedTrackId.value])).add(trackId));
+        selectedTrackId.value = null;
+      }
+      if (multiSelectList.value.length > 0) {
+        editingMultiTrack.value = true;
+        selectedTrackId.value = null;
+      }
+      return;
+    }
+
     /**
      * If merge is in progress, add selected tracks to the merge list
      */
-    if (trackId !== null && mergeInProgress.value) {
-      mergeList.value = Array.from((new Set(mergeList.value).add(trackId)));
+    if (trackId !== null && multiSelectActive.value) {
+      multiSelectList.value = Array.from((new Set(multiSelectList.value).add(trackId)));
+      /**
+       * If editing group, then the newly selected track should be added to the group
+       */
+      if (editingGroupId.value !== null && !edit) {
+        const track = cameraStore.getAnyTrack(trackId);
+        const groupStore = cameraStore.camMap.value.get(selectedCamera.value)?.groupStore;
+        if (groupStore) {
+          groupStore.get(editingGroupId.value).addMembers({
+            [trackId]: { ranges: [[track.begin, track.end]] },
+          });
+        }
+      } else if (edit) {
+        editingGroupId.value = null;
+        multiSelectList.value = [];
+      }
+    } else if (linkingState.value) {
+      // Only use the first non-null track with is clicked on to link
+      if (trackId !== null) {
+        _setLinkingTrack(trackId);
+      }
+      return;
     }
-    /* Do not allow editing when merge is in progres */
-    selectTrack(trackId, edit && !mergeInProgress.value);
+    /* Do not allow editing when merge is in progress */
+    selectTrack(trackId, edit && !multiSelectActive.value);
+  }
+
+  /** Put UI into group editing mode. */
+  function handleGroupEdit(groupId: AnnotationId | null) {
+    creating = false;
+    editingTrack.value = false;
+    editingGroupId.value = groupId;
+    if (groupId !== null) {
+      /** When moving into a group edit mode, multi-select all track members */
+      const groupStore = cameraStore.camMap.value.get(selectedCamera.value)?.groupStore;
+      if (groupStore) {
+        const group = groupStore.get(groupId);
+        multiSelectList.value = group.memberIds;
+        selectedTrackId.value = null;
+        seekNearest(cameraStore.getAnyTrack(multiSelectList.value[0]));
+      }
+    }
   }
 
   //Handles deselection or hitting escape including while editing
   function handleEscapeMode() {
     if (selectedTrackId.value !== null) {
-      const track = trackMap.get(selectedTrackId.value);
-      if (track && track.begin === track.end) {
-        const features = track.getFeature(track.begin);
-        // If no features exist we remove the empty track
-        if (!features.filter((item) => item !== null).length) {
-          removeTrack(selectedTrackId.value);
-        }
-      }
+      _removeIfEmpty(selectedTrackId.value);
     }
-    mergeList.value = [];
+    linkingState.value = false;
+    linkingCamera.value = '';
+    linkingTrack.value = null;
+    multiSelectList.value = [];
+    handleGroupEdit(null);
     handleSelectTrack(null, false);
   }
 
-  function handleAddTrackOrDetection(): TrackId {
-    // Handles adding a new track with the NewTrack Settings
-    const { frame } = mediaController.value;
-    const newTrackId = addTrack(
-      frame.value, trackSettings.value.newTrackSettings.type,
-      selectedTrackId.value || undefined,
-    ).trackId;
-    selectTrack(newTrackId, true);
-    creating = true;
-    return newTrackId;
-  }
-
-  function handleTrackTypeChange(trackId: TrackId | null, value: string) {
-    if (trackId !== null) {
-      getTrack(trackMap, trackId).setType(value);
+  function handleAddTrackOrDetection(overrideTrackId?: number): TrackId {
+    // If a segmentation recipe has a pending prediction, commit it permanently
+    // by clearing preSegmentationFeatures. Without this, selectTrack calls
+    // resetPoints → handleSegmentationReset which restores the pre-segmentation
+    // state (deleting the polygon) AFTER _removeIfEmpty already ran, leaving
+    // an empty detection in the list.
+    const hasSegPrediction = recipes.some(
+      (r) => r instanceof SegmentationPointClick && r.active.value && r.hasPendingPrediction(),
+    );
+    if (hasSegPrediction) {
+      preSegmentationFeatures.clear();
     }
+    // Finalize any in-progress shape (e.g., incomplete polygon) before
+    // escaping and creating a new track. This commits the shape if valid
+    // (3+ polygon vertices) or discards it otherwise.
+    if (finalizeCreationCallback) {
+      finalizeCreationCallback();
+    }
+    // Handles adding a new track with the NewTrack Settings
+    handleEscapeMode();
+    const frame = selectedCameraFrame();
+    let trackType = trackSettings.value.newTrackSettings.type;
+    let sourceTrack: Track | undefined;
+    if (overrideTrackId !== undefined) {
+      sourceTrack = cameraStore.getAnyPossibleTrack(overrideTrackId);
+      if (sourceTrack !== undefined) {
+        // eslint-disable-next-line prefer-destructuring
+        trackType = sourceTrack.confidencePairs[0][0];
+      }
+    } else {
+      // eslint-disable-next-line no-param-reassign
+      overrideTrackId = cameraStore.getNewTrackId();
+    }
+    const trackStore = cameraStore.camMap.value.get(selectedCamera.value)?.trackStore;
+    if (trackStore) {
+      const newTrack = trackStore.add(
+        frame,
+        trackType,
+        selectedTrackId.value || undefined,
+        overrideTrackId,
+      );
+      if (sourceTrack) {
+        newTrack.confidencePairs = cloneDeep(sourceTrack.confidencePairs);
+      }
+      selectTrack(newTrack.id, true);
+      creating = true;
+      return newTrack.id;
+    }
+    throw Error(`Could not find trackStore for Camera: ${selectedCamera.value}`);
   }
 
   function newTrackSettingsAfterLogic(addedTrack: Track) {
@@ -207,12 +603,12 @@ export default function useModeManager({
         if (trackSettings.value.newTrackSettings.mode === 'Track'
         && trackSettings.value.newTrackSettings.modeSettings.Track.autoAdvanceFrame
         ) {
-          mediaController.value.nextFrame();
+          aggregateController.value.nextFrame();
           newCreatingValue = true;
         } else if (trackSettings.value.newTrackSettings.mode === 'Detection') {
           if (
             trackSettings.value.newTrackSettings.modeSettings.Detection.continuous) {
-            handleAddTrackOrDetection();
+            handleAddTrackOrDetection(cameraStore.getNewTrackId());
             newCreatingValue = true; // don't disable creating mode
           }
         }
@@ -222,12 +618,189 @@ export default function useModeManager({
     creating = newCreatingValue;
   }
 
-  function handleUpdateRectBounds(frameNum: number, flickNum: number, bounds: RectBounds) {
+  /**
+   * Continuous cross-camera mirror: while the Align View is active (the rig
+   * is fully aligned and the user toggled the aligned display), re-project
+   * the source camera's keyframe at `sourceFrame` onto every other camera
+   * through the camera-to-camera homographies, creating the
+   * same-id track on cameras where it doesn't exist yet. Stored geometry
+   * stays native per camera (decision D3): each camera receives coordinates
+   * already mapped into its own image space.
+   *
+   * Called after every geometry write/removal below; a no-op when the
+   * aligned view is off, so single-camera and unaligned multicam behavior is
+   * unchanged. The camera that received the edit is always the source, so
+   * later edits on any camera re-sync the others (continuous mirror --
+   * per-camera fine-tuning is intentionally overwritten by the next edit).
+   */
+  function mirrorFeatureToAlignedCameras(trackId: AnnotationId, sourceFrame: number) {
+    if (!alignedView?.active.value) {
+      return;
+    }
+    const sourceCamera = selectedCamera.value;
+    const sourceTrack = cameraStore.getPossibleTrack(trackId, sourceCamera);
+    if (!sourceTrack) {
+      return;
+    }
+    const sourceFeature = sourceTrack.features[sourceFrame];
+    const hasKeyframe = Boolean(sourceFeature && sourceFeature.keyframe);
+    // Under an aligned timeline, cameras sit on different local frames for
+    // the same instant; the per-camera controller frames give the mapping
+    // for the CURRENT slot. Edits at any other frame (e.g. multi-frame
+    // segmentation) fall back to the same local frame number.
+    const sourceIsCurrentFrame = sourceFrame === selectedCameraFrame();
+    cameraStore.camMap.value.forEach(({ trackStore }, cameraName) => {
+      if (cameraName === sourceCamera) {
+        return;
+      }
+      const matrix = alignedView.cameraToCamera(sourceCamera, cameraName);
+      if (!matrix) {
+        return;
+      }
+      let targetFrame = sourceFrame;
+      if (sourceIsCurrentFrame) {
+        try {
+          const controller = aggregateController.value.getController(cameraName);
+          if (!controller.hasFrame.value) {
+            // This camera has no frame at the current aligned slot.
+            return;
+          }
+          targetFrame = controller.frame.value;
+        } catch {
+          // No controller mounted for the camera; assume matching local frames.
+        }
+      }
+      let targetTrack = trackStore.getPossible(trackId);
+      if (!hasKeyframe) {
+        // The source keyframe was removed: drop the mirrored keyframe too,
+        // and the mirrored track itself when that leaves it empty.
+        if (targetTrack && targetTrack.features[targetFrame]?.keyframe) {
+          targetTrack.deleteFeature(targetFrame);
+          if (targetTrack.featureIndex.length === 0) {
+            trackStore.remove(trackId);
+          }
+        }
+        return;
+      }
+      const mappedGeometry = sourceFeature.geometry
+        ? mapGeoJSONFeatures(matrix, sourceFeature.geometry.features)
+        : [];
+      let mappedBounds: RectBounds | undefined;
+      let mappedRotation: number | undefined;
+      const sourceRotation = getRotationFromAttributes(sourceFeature.attributes);
+      if (sourceFeature.bounds) {
+        if (sourceRotation !== undefined) {
+          const mapped = mapRotatedBounds(matrix, sourceFeature.bounds, sourceRotation);
+          mappedBounds = mapped.bounds;
+          mappedRotation = validateRotation(mapped.rotation);
+        } else {
+          mappedBounds = mapBounds(matrix, sourceFeature.bounds);
+        }
+      }
+      if (!targetTrack) {
+        targetTrack = trackStore.add(
+          targetFrame,
+          sourceTrack.confidencePairs[0][0],
+          undefined,
+          trackId,
+        );
+        targetTrack.confidencePairs = cloneDeep(sourceTrack.confidencePairs);
+      }
+      // setFeature only upserts geometry by (key, type): drop mirrored
+      // geometry the source no longer has so deletions propagate too.
+      const targetFeature = targetTrack.features[targetFrame];
+      if (targetFeature?.geometry) {
+        const mappedKeys = new Set(mappedGeometry.map(
+          (geo) => `${geo.properties?.key ?? ''}|${geo.geometry.type}`,
+        ));
+        targetFeature.geometry.features = targetFeature.geometry.features.filter(
+          (geo) => mappedKeys.has(`${geo.properties?.key ?? ''}|${geo.geometry.type}`),
+        );
+      }
+      targetTrack.setFeature({
+        frame: targetFrame,
+        flick: sourceFeature.flick,
+        bounds: mappedBounds,
+        keyframe: true,
+        interpolate: sourceFeature.interpolate,
+      }, mappedGeometry);
+      if (mappedRotation !== undefined) {
+        targetTrack.setFeatureAttribute(targetFrame, ROTATION_ATTRIBUTE_NAME, mappedRotation);
+      } else {
+        const written = targetTrack.features[targetFrame];
+        if (written?.attributes && ROTATION_ATTRIBUTE_NAME in written.attributes) {
+          targetTrack.setFeatureAttribute(targetFrame, ROTATION_ATTRIBUTE_NAME, undefined);
+        }
+      }
+    });
+  }
+
+  function handleUpdateRectBounds(frameNum: number, flickNum: number, bounds: RectBounds, rotation?: number) {
     if (selectedTrackId.value !== null) {
-      const track = trackMap.get(selectedTrackId.value);
+      const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
       if (track) {
         // Determines if we are creating a new Detection
-        const { interpolate } = track.canInterpolate(frameNum);
+        const { interpolate, features } = track.canInterpolate(frameNum);
+        const [real] = features;
+        // If there's already a keyframe at this frame, we're editing an existing annotation
+        const isEditingExisting = real !== null && real.keyframe;
+        const normalizedRotation = validateRotation(rotation);
+        // Prefer the rotation passed with this edit. validateRotation maps ~0 to
+        // undefined, so detect an explicit arg via the raw parameter — otherwise
+        // fall back to the detection's stored rotation and avoid axis-align
+        // clipping a rotated box's polygon against its unrotated envelope.
+        const effectiveRotation = (rotation !== undefined && rotation !== null)
+          ? normalizedRotation
+          : getRotationFromAttributes(
+            track.features[frameNum]?.attributes ?? real?.attributes,
+          );
+
+        // Keep polygons in sync with box edits. setFeature rounds bounds, so
+        // compare/clip against rounded values. Rotated boxes are skipped:
+        // their stored bounds are the unrotated envelope, so an axis-aligned
+        // clip would cut the wrong region.
+        // - Pure move (same size, new origin): translate polygons by the delta.
+        // - Resize: trim polygons that stick outside the new box.
+        const updatedGeometry: GeoJSON.Feature<TrackSupportedFeature>[] = [];
+        const removedPolygonKeys: string[] = [];
+        if (!hasSignificantRotation(effectiveRotation)) {
+          const roundedBounds: RectBounds = [
+            Math.round(bounds[0]), Math.round(bounds[1]),
+            Math.round(bounds[2]), Math.round(bounds[3]),
+          ];
+          const oldBounds: RectBounds | null = real?.bounds
+            ? [
+              Math.round(real.bounds[0]), Math.round(real.bounds[1]),
+              Math.round(real.bounds[2]), Math.round(real.bounds[3]),
+            ]
+            : null;
+          const polygons = track.getFeatureGeometry(frameNum, { type: 'Polygon' });
+          if (oldBounds && isBoundsTranslation(oldBounds, roundedBounds)) {
+            const dx = roundedBounds[0] - oldBounds[0];
+            const dy = roundedBounds[1] - oldBounds[1];
+            polygons.forEach((polyFeature) => {
+              const polygon = polyFeature.geometry as GeoJSON.Polygon;
+              updatedGeometry.push({
+                ...polyFeature,
+                geometry: translatePolygon(polygon, dx, dy),
+              });
+            });
+          } else {
+            polygons.forEach((polyFeature) => {
+              const polygon = polyFeature.geometry as GeoJSON.Polygon;
+              if (!polygonWithinBounds(polygon, roundedBounds)) {
+                const clipped = clipPolygonToBounds(polygon, roundedBounds);
+                // A clip that leaves the polygon identical to the box carries
+                // no information beyond the box itself, so drop it too.
+                if (clipped && !polygonEqualsBounds(clipped, roundedBounds)) {
+                  updatedGeometry.push({ ...polyFeature, geometry: clipped });
+                } else {
+                  removedPolygonKeys.push(polyFeature.properties?.key ?? '');
+                }
+              }
+            });
+          }
+        }
 
         track.setFeature({
           frame: frameNum,
@@ -235,8 +808,95 @@ export default function useModeManager({
           bounds,
           keyframe: true,
           interpolate: _shouldInterpolate(interpolate),
+        }, updatedGeometry);
+        removedPolygonKeys.forEach((key) => {
+          track.removeFeatureGeometry(frameNum, { key, type: 'Polygon' });
         });
+
+        // Save rotation as detection attribute if provided
+        if (normalizedRotation !== undefined) {
+          track.setFeatureAttribute(frameNum, ROTATION_ATTRIBUTE_NAME, normalizedRotation);
+        } else {
+          // Remove rotation attribute if rotation is 0 or undefined
+          const feature = track.features[frameNum];
+          if (feature && feature.attributes && ROTATION_ATTRIBUTE_NAME in feature.attributes) {
+            track.setFeatureAttribute(frameNum, ROTATION_ATTRIBUTE_NAME, undefined);
+          }
+        }
+
+        // Mark as user-modified if editing existing annotation (as detection attribute)
+        // Skip if track is userCreated (user-created tracks don't need userModified on every detection)
+        if (isEditingExisting && track.attributes?.userCreated !== true) {
+          track.setFeatureAttribute(frameNum, 'userModified', true);
+        }
+
+        mirrorFeatureToAlignedCameras(track.id, frameNum);
+
+        // Capture track ID before newTrackSettingsAfterLogic, which may
+        // create a new track in continuous detection mode and change
+        // selectedTrackId
+        const completedTrackId = selectedTrackId.value as number;
+
         newTrackSettingsAfterLogic(track);
+
+        // First box on this frame (no prior feature here). Do not require
+        // `creating`: that flag clears after the first shape, but Track-mode
+        // edits still draw new boxes on later frames of the same track.
+        // Interpolated frames have a non-null `real`, so resizing them does
+        // not re-trigger.
+        if (onNewAnnotationGeometry && real === null) {
+          onNewAnnotationGeometry({
+            camera: selectedCamera.value,
+            trackId: completedTrackId,
+            frameNum,
+            source: 'box',
+            bounds: bounds as [number, number, number, number],
+          });
+        }
+
+        // Stereo: emit box annotation complete
+        if (onStereoAnnotationComplete && stereoInteractiveActive()) {
+          onStereoAnnotationComplete({
+            type: 'box',
+            camera: selectedCamera.value,
+            trackId: completedTrackId,
+            frameNum,
+            bounds: bounds as [number, number, number, number],
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Set a feature on a track with proper interpolation handling.
+   * This is used by segmentation and other modes that need to set features
+   * while respecting track settings and interpolation logic.
+   */
+  function handleSetTrackFeature(
+    frameNum: number,
+    bounds: RectBounds,
+    geometry: GeoJSON.Feature<TrackSupportedFeature>[],
+    runAfterLogic: boolean = true,
+  ) {
+    if (selectedTrackId.value !== null) {
+      const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+      if (track) {
+        const { interpolate } = track.canInterpolate(frameNum);
+
+        track.setFeature({
+          frame: frameNum,
+          flick: 0,
+          bounds,
+          keyframe: true,
+          interpolate: _shouldInterpolate(interpolate),
+        }, geometry);
+
+        mirrorFeatureToAlignedCameras(track.id, frameNum);
+
+        if (runAfterLogic) {
+          newTrackSettingsAfterLogic(track);
+        }
       }
     }
   }
@@ -270,11 +930,14 @@ export default function useModeManager({
     };
 
     if (selectedTrackId.value !== null) {
-      const track = trackMap.get(selectedTrackId.value);
+      const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
       if (track) {
         // newDetectionMode is true if there's no keyframe on frameNum
         const { features, interpolate } = track.canInterpolate(frameNum);
         const [real] = features;
+        const previousLine = real?.geometry?.features.find((g) => g.geometry.type === 'LineString' && g.properties?.key === key);
+        const previousCoordinates = previousLine?.geometry.type === 'LineString'
+          ? previousLine.geometry.coordinates.map((p) => [...p]) : undefined;
 
         // Give each recipe the opportunity to make changes
         recipes.forEach((recipe) => {
@@ -315,16 +978,18 @@ export default function useModeManager({
 
         // If a drawable changed, but we aren't changing modes
         // prevent an interrupt within EditAnnotationLayer
+        // Use === undefined to distinguish "no key change" from "change to empty key"
         if (
           somethingChanged
-          && !update.newSelectedKey
+          && update.newSelectedKey === undefined
           && !update.newType
           && preventInterrupt
         ) {
           preventInterrupt();
         } else {
           // Otherwise, one of these state changes will trigger an interrupt.
-          if (update.newSelectedKey) {
+          // Use !== undefined to allow setting key to empty string
+          if (update.newSelectedKey !== undefined) {
             selectedKey.value = update.newSelectedKey;
           }
           if (update.newType) {
@@ -334,24 +999,130 @@ export default function useModeManager({
         }
         // Update the state of the track in the trackstore.
         if (somethingChanged) {
+          // If there's already a keyframe at this frame, we're editing an existing annotation
+          const isEditingExisting = real !== null && real.keyframe;
+
           track.setFeature({
             frame: frameNum,
             flick: flickNum,
             keyframe: true,
             bounds: updateBounds(real?.bounds, update.union, update.unionWithoutBounds),
-            interpolate,
-          }, flatMapDeep(update.geoJsonFeatureRecord,
+            interpolate: _shouldInterpolate(interpolate),
+          }, flatMapDeep(
+            update.geoJsonFeatureRecord,
             (geomlist, key_) => geomlist.map((geom) => ({
               type: geom.type,
               geometry: geom.geometry,
               properties: { key: key_ },
-            }))));
+            })),
+          ));
+
+          // Mark as user-modified if editing existing annotation (as detection attribute)
+          // Skip if track is userCreated (user-created tracks don't need userModified on every detection)
+          if (isEditingExisting && track.attributes?.userCreated !== true) {
+            track.setFeatureAttribute(frameNum, 'userModified', true);
+          }
+
+          mirrorFeatureToAlignedCameras(track.id, frameNum);
+
+          // Emit persisted named points. Completed lines use their existing
+          // whole-line transfer event instead, and the first end of a line still
+          // being drawn waits for it: mapping it mid-draw interrupts the draw.
+          if (onStereoAnnotationComplete && stereoInteractiveActive()
+              && update.done.every((v) => v !== false)
+              && !(data.geometry.type === 'LineString' && data.geometry.coordinates.length >= 2)) {
+            Object.entries(update.geoJsonFeatureRecord).forEach(([pointKey, geoms]) => {
+              geoms.forEach((geom) => {
+                if (geom.geometry.type === 'Point' && pointKey) {
+                  onStereoAnnotationComplete({
+                    type: 'point',
+                    camera: selectedCamera.value,
+                    trackId: track.id as number,
+                    frameNum,
+                    point: geom.geometry.coordinates as [number, number],
+                    key: pointKey,
+                  });
+                }
+              });
+            });
+          }
 
           // Only perform "initialization" after the first shape.
           // Treat this as a completed annotation if eventType is editing
           // Or none of the recieps reported that they were unfinished.
           if (eventType === 'editing' || update.done.every((v) => v !== false)) {
+            // Capture track ID before newTrackSettingsAfterLogic which may
+            // change selectedTrackId in continuous detection mode
+            const completedTrackId = selectedTrackId.value;
+            // A line is "new" until it has been completed once on this frame.
+            // In-progress draws store a head/tail Point first; edits already
+            // have a 2+ point LineString. Do not require `creating` so a later
+            // frame of the same track still auto-populates.
+            const isNewCompletedLine = data.geometry.type === 'LineString'
+              && data.geometry.coordinates.length >= 2
+              && (!previousCoordinates || previousCoordinates.length < 2);
+
             newTrackSettingsAfterLogic(track);
+
+            if (onNewAnnotationGeometry && isNewCompletedLine && completedTrackId !== null) {
+              onNewAnnotationGeometry({
+                camera: selectedCamera.value,
+                trackId: completedTrackId as number,
+                frameNum,
+                source: 'line',
+                line: data.geometry.coordinates as [number, number][],
+              });
+            }
+
+            // Stereo: emit line or polygon annotation complete
+            if (onStereoAnnotationComplete && stereoInteractiveActive()
+                && completedTrackId !== null) {
+              // Check for LineString with exactly 2 points (line annotation)
+              if (data.geometry.type === 'LineString'
+                  && data.geometry.coordinates.length >= 2) {
+                const coords = data.geometry.coordinates as [number, number][];
+                const editedPoint = linePointEdit(previousCoordinates, coords);
+                if (editedPoint) {
+                  onStereoAnnotationComplete({
+                    type: 'point',
+                    camera: selectedCamera.value,
+                    trackId: completedTrackId as number,
+                    frameNum,
+                    ...editedPoint,
+                  });
+                } else {
+                  onStereoAnnotationComplete({
+                    type: 'line',
+                    camera: selectedCamera.value,
+                    trackId: completedTrackId as number,
+                    frameNum,
+                    line: coords,
+                    key: selectedKey.value,
+                  });
+                }
+              }
+              // Check for completed Polygon (done=true from recipes)
+              if (update.done.some((v) => v === true)) {
+                // Look for polygon geometry in the update record
+                Object.entries(update.geoJsonFeatureRecord).forEach(([geoKey, features]) => {
+                  features.forEach((feat) => {
+                    if (feat.geometry.type === 'Polygon'
+                        && feat.geometry.coordinates[0]
+                        && feat.geometry.coordinates[0].length >= 3) {
+                      const polyCoords = feat.geometry.coordinates[0] as [number, number][];
+                      onStereoAnnotationComplete({
+                        type: 'polygon',
+                        camera: selectedCamera.value,
+                        trackId: completedTrackId as number,
+                        frameNum,
+                        polygon: polyCoords,
+                        key: geoKey,
+                      });
+                    }
+                  });
+                });
+              }
+            }
           }
         }
       } else {
@@ -365,13 +1136,12 @@ export default function useModeManager({
   /* If any recipes are active, allow them to remove a point */
   function handleRemovePoint() {
     if (selectedTrackId.value !== null && selectedFeatureHandle.value !== -1) {
-      const track = trackMap.get(selectedTrackId.value);
+      const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
       if (track) {
         recipes.forEach((r) => {
           if (r.active.value) {
-            const { frame } = mediaController.value;
             r.deletePoint(
-              frame.value,
+              selectedCameraFrame(),
               track,
               selectedFeatureHandle.value,
               selectedKey.value,
@@ -379,22 +1149,59 @@ export default function useModeManager({
             );
           }
         });
+        mirrorFeatureToAlignedCameras(track.id, selectedCameraFrame());
+        const line = track.getFeatureGeometry(selectedCameraFrame(), { type: 'LineString', key: selectedKey.value })[0];
+        if (line?.geometry.type === 'LineString' && onStereoAnnotationComplete && stereoInteractiveActive()) {
+          onStereoAnnotationComplete({
+            type: 'line',
+            camera: selectedCamera.value,
+            trackId: track.id as number,
+            frameNum: selectedCameraFrame(),
+            line: line.geometry.coordinates as [number, number][],
+            key: selectedKey.value,
+          });
+        }
       }
     }
-    handleSelectFeatureHandle(-1);
+    // Clear the deleted handle, not the geometry key that keeps the editor on
+    // the remaining line (or on its surviving endpoint when only one remains).
+    handleSelectFeatureHandle(-1, selectedKey.value);
+    _nudgeEditingCanary();
   }
 
   /* If any recipes are active, remove the geometry they added */
   function handleRemoveAnnotation() {
     if (selectedTrackId.value !== null) {
-      const track = trackMap.get(selectedTrackId.value);
+      const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
       if (track) {
-        const { frame } = mediaController.value;
+        const frameNum = selectedCameraFrame();
         recipes.forEach((r) => {
           if (r.active.value) {
-            r.delete(frame.value, track, selectedKey.value, annotationModes.editing);
+            r.delete(frameNum, track, selectedKey.value, annotationModes.editing);
           }
         });
+
+        // After deleting a polygon, recalculate bounds from remaining polygons
+        if (annotationModes.editing === 'Polygon') {
+          const remainingPolygons = track.getPolygonFeatures(frameNum);
+          if (remainingPolygons.length > 0) {
+            // Recalculate bounds from remaining polygons
+            const polygonGeometries = remainingPolygons.map((p) => p.geometry);
+            const newBounds = updateBounds(undefined, [], polygonGeometries);
+
+            // Get current feature and update with new bounds
+            const [currentFeature] = track.getFeature(frameNum);
+            if (currentFeature && newBounds) {
+              track.setFeature({
+                ...currentFeature,
+                bounds: newBounds,
+              });
+            }
+          }
+        }
+
+        mirrorFeatureToAlignedCameras(track.id, frameNum);
+
         _nudgeEditingCanary();
       }
     }
@@ -404,19 +1211,47 @@ export default function useModeManager({
    * Unstage a track from the merge list
    */
   function handleUnstageFromMerge(trackIds: TrackId[]) {
-    mergeList.value = mergeList.value.filter((trackId) => !trackIds.includes(trackId));
+    multiSelectList.value = multiSelectList.value.filter((trackId) => !trackIds.includes(trackId));
+    /* Unselect a track when it is unstaged */
+    if (selectedTrackId.value !== null && trackIds.includes(selectedTrackId.value)) {
+      handleSelectTrack(null);
+    }
+    /** Remove members from group if group editing */
+    if (editingGroupId.value !== null) {
+      const groupStore = cameraStore.camMap.value.get(selectedCamera.value)?.groupStore;
+      if (groupStore) {
+        const group = groupStore.annotationMap.get(editingGroupId.value);
+        if (group) group.removeMembers(trackIds);
+      }
+    }
+    /** Exit group editing mode if last track is removed */
+    if (multiSelectList.value.length === 0) {
+      handleEscapeMode();
+    }
   }
 
-  async function handleRemoveTrack(trackIds: TrackId[], forcePromptDisable = false) {
+  async function handleRemoveTrack(
+    trackIds: TrackId[],
+    forcePromptDisable = false,
+    cameraName = '',
+    autoSelectNextTrack = true,
+  ) {
     /* Figure out next track ID */
     const maybeNextTrackId = selectNextTrack(1);
-    const previousOrNext = maybeNextTrackId !== null
+    let previousOrNext = maybeNextTrackId !== null
       ? maybeNextTrackId
       : selectNextTrack(-1);
     /* Delete track */
     if (!forcePromptDisable && trackSettings.value.deletionSettings.promptUser) {
       const trackStrings = trackIds.map((track) => track.toString());
+      const groups = flattenDeep(
+        trackIds.map((trackId) => cameraStore.lookupGroups(trackId)),
+      );
       const text = (['Would you like to delete the following tracks:']).concat(trackStrings);
+      if (groups.length > 0) {
+        text.push('');
+        text.push(`This track will be removed from ${groups.length} groups.`);
+      }
       text.push('');
       text.push('This setting can be changed under the Track Settings');
       const result = await prompt({
@@ -431,32 +1266,93 @@ export default function useModeManager({
       }
     }
     trackIds.forEach((trackId) => {
-      removeTrack(trackId);
+      cameraStore.remove(trackId, cameraName);
     });
+
+    if (!multiSelectList.value.length) {
+      editingMultiTrack.value = false;
+      previousOrNext = null;
+    }
+
     handleUnstageFromMerge(trackIds);
-    selectTrack(previousOrNext, false);
+    if (autoSelectNextTrack) {
+      selectTrack(previousOrNext, false);
+    }
   }
 
   /** Toggle editing mode for track */
   function handleTrackEdit(trackId: TrackId) {
-    const track = getTrack(trackMap, trackId);
-    seekNearest(track);
-    const editing = trackId === selectedTrackId.value ? (!editingTrack.value) : true;
-    handleSelectTrack(trackId, editing);
-  }
-
-  function handleTrackClick(trackId: TrackId) {
-    const track = getTrack(trackMap, trackId);
-    seekNearest(track);
-    handleSelectTrack(trackId, editingTrack.value);
-  }
-
-  function handleSelectNext(delta: number) {
-    const newTrack = selectNextTrack(delta);
-    if (newTrack !== null) {
-      handleSelectTrack(newTrack, false);
-      seekNearest(getTrack(trackMap, newTrack));
+    const track = cameraStore.getPossibleTrack(trackId, selectedCamera.value);
+    if (track) {
+      seekNearest(track);
+      const editing = trackId === selectedTrackId.value ? (!editingTrack.value) : true;
+      // When in LineString mode, set the selected key so EditAnnotationLayer
+      // can find the geometry (lines are stored with a recipe key like 'HeadTails').
+      if (editing) {
+        const [feature] = track.getFeature(selectedCameraFrame());
+        if (feature?.geometry?.features?.length) {
+          if (annotationModes.editing === 'LineString') {
+            const lineFeature = feature.geometry.features.find(
+              (f) => f.geometry.type === 'LineString',
+            );
+            selectedKey.value = lineFeature?.properties?.key || '';
+          }
+        }
+        // If editing type is Point (segmentation), ensure the segmentation
+        // recipe is active so point clicks generate segmentation predictions.
+        // Only set the active flag directly - don't call activate() which would
+        // re-emit the activate event and interfere with the track selection.
+        if (annotationModes.editing === 'Point') {
+          const segRecipe = recipes.find(
+            (rec) => rec instanceof SegmentationPointClick && !rec.active.value,
+          ) as SegmentationPointClick | undefined;
+          if (segRecipe) {
+            segRecipe.active.value = true;
+          }
+        }
+      }
+      handleSelectTrack(trackId, editing);
+    } else if (cameraStore.getAnyTrack(trackId) !== undefined) {
+      //track exists in other cameras we create in the current map using override
+      handleAddTrackOrDetection(trackId);
+      const camTrack = cameraStore.getPossibleTrack(trackId, selectedCamera.value);
+      // now that we have a new track we select it for editing
+      if (camTrack) {
+        const editing = trackId === selectedTrackId.value;
+        handleSelectTrack(trackId, editing);
+      }
     }
+  }
+
+  function handleTrackClick(trackId: TrackId, modifiers?: { ctrl: boolean }) {
+    const track = cameraStore.getTrackProjection(trackId);
+    seekNearest(track);
+    handleSelectTrack(trackId, editingTrack.value, modifiers);
+  }
+
+  function handleSelectNext(
+    delta: number,
+    filteredOverride?: readonly SortedAnnotation<Track>[],
+  ) {
+    const newTrack = selectNext(filteredOverride ?? _filteredTracks.value, selectedTrackId.value, delta);
+    /** Only allow selectNext when not in group editing mode. */
+    if (newTrack !== null && editingGroupId.value === null) {
+      handleSelectTrack(newTrack, false);
+      seekNearest(cameraStore.getAnyTrack(newTrack));
+    }
+  }
+
+  /**
+   * Entering polygon editing without naming a polygon: land on one the
+   * detection already has (masks are often keyed, e.g. SegmentationPolygon)
+   * so its vertices are editable at once rather than starting a new polygon.
+   */
+  function existingPolygonKey(): string {
+    if (selectedTrackId.value === null) return '';
+    const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+    const keys = track?.getPolygonFeatures(selectedCameraFrame()).map((p) => p.key) ?? [];
+    if (!keys.length || keys.includes('')) return '';
+    return keys.includes(selectedKey.value) ? selectedKey.value : keys[0];
   }
 
   function handleSetAnnotationState({
@@ -466,8 +1362,22 @@ export default function useModeManager({
       annotationModes.visible = visible;
     }
     if (editing) {
+      // Match EditorMenu toolsDisabled so async recipe activate (e.g. seg init)
+      // cannot create/edit while the toolbar is blocked.
+      if (readonlyState.value || multiSelectActive.value
+          || editingGroupId.value !== null || linkingState.value
+          || lassoModeActive?.value || lassoDrawing?.value) {
+        // completeActivation may already have set recipe.active before emitting.
+        if (recipeName) {
+          recipes.find((r) => r.name === recipeName)?.deactivate();
+        }
+        return;
+      }
       annotationModes.editing = editing;
-      _selectKey(key);
+      if (selectedTrackId.value === null) {
+        handleAddTrackOrDetection();
+      }
+      _selectKey(editing === 'Polygon' && !key ? existingPolygonKey() : key);
       handleSelectTrack(selectedTrackId.value, true);
       recipes.forEach((r) => {
         if (recipeName !== r.name) {
@@ -478,67 +1388,633 @@ export default function useModeManager({
   }
 
   /**
-   * Merge: Enabled whenever there are candidates in the merge list
+   * Confirm the current annotation for any active recipe that supports it.
+   * Called when right-click is used in Point mode to lock the annotation.
    */
-  function handleToggleMerge(): TrackId[] {
-    if (!mergeInProgress.value && selectedTrackId.value !== null) {
-      /* If no merge in progress and there is a selected track id */
-      mergeList.value = [selectedTrackId.value];
-      /* no editing in merge mode */
-      selectTrack(selectedTrackId.value, false);
-    } else {
-      mergeList.value = [];
+  function handleConfirmRecipe() {
+    // A pending prediction is committed; with nothing placed (or after an
+    // Escape reset) the right-click just finalizes the detection, leaving
+    // edit mode. Neither applies to the contextmenu of the very press that
+    // entered edit mode, which Windows delivers after mouseup.
+    let hadPendingPredictionOrReset = false;
+    recipes.forEach((r) => {
+      if (r.active.value && r.confirm && r instanceof SegmentationPointClick) {
+        if (r.hasPendingPrediction() || r.wasReset) {
+          hadPendingPredictionOrReset = true;
+        }
+      }
+    });
+    if (!hadPendingPredictionOrReset) {
+      if (selectedTrackId.value === null || !editingTrack.value
+          || mouseDownCount === editEnteredOnMouseDown) {
+        return;
+      }
     }
-    return mergeList.value;
+    const activeSegRecipes: SegmentationPointClick[] = [];
+    recipes.forEach((r) => {
+      if (r.active.value && r.confirm) {
+        if (r instanceof SegmentationPointClick) {
+          activeSegRecipes.push(r);
+        }
+        r.confirm();
+      }
+    });
+    // Clear saved state - the confirmed polygons are now permanent
+    preSegmentationFeatures.clear();
+    onStereoSegmentationFinalize?.();
+    // Re-arm the recipe for the next detection first: activating it
+    // re-selects the current track in edit mode (handleSetAnnotationState).
+    activeSegRecipes.forEach((r) => r.activate());
+    const confirmedId = selectedTrackId.value;
+    if (confirmedId !== null) _removeIfEmpty(confirmedId);
+    selectTrack(null, false);
   }
 
   /**
-   * Merge: Commit the merge list
+   * Finalize any pending segmentation on the current camera WITHOUT
+   * deselecting the track, then re-arm the recipe. Used by the cross-camera
+   * continuation flow: when a segmentation point click lands on another
+   * camera, the current camera's pending mask is locked in first, and the
+   * recipe's accumulated prompt points are cleared so they cannot leak into
+   * the other camera's prediction (the points belong to this camera's image).
+   */
+  function handleSegmentationFinalizePending() {
+    const activeSegRecipes = recipes.filter(
+      (r): r is SegmentationPointClick => r instanceof SegmentationPointClick && r.active.value,
+    );
+    if (!activeSegRecipes.length) {
+      return;
+    }
+    if (!activeSegRecipes.some((r) => r.hasPendingPrediction() || r.hasPoints())) {
+      // Nothing in progress on this camera: the recipe is already fresh.
+      return;
+    }
+    // confirm() commits the pending mask (or just deactivates when there is
+    // none); the commit targets the still-selected camera's track.
+    activeSegRecipes.forEach((r) => r.confirm());
+    // The confirmed polygons are now permanent.
+    preSegmentationFeatures.clear();
+    onStereoSegmentationFinalize?.();
+    // Re-activate so the next click (on the other camera) segments fresh.
+    // completeActivation re-emits Point editing mode and keeps the current
+    // selection (handleSetAnnotationState re-selects the same track).
+    activeSegRecipes.forEach((r) => {
+      if (!r.active.value) {
+        r.activate();
+      }
+    });
+  }
+
+  /**
+   * Merge: Enabled whenever there are candidates in the merge list
+   */
+  function handleToggleMerge(): TrackId[] {
+    if (!multiSelectActive.value && selectedTrackId.value !== null) {
+      /* If no merge in progress and there is a selected track id */
+      multiSelectList.value = [selectedTrackId.value];
+      /* no editing in merge mode */
+      selectTrack(selectedTrackId.value, false);
+    } else {
+      multiSelectList.value = [];
+      handleGroupEdit(null);
+    }
+    return multiSelectList.value;
+  }
+
+  /**
+   * Merge: Commit the multi-select list to merge
    */
   function handleCommitMerge() {
-    if (mergeList.value.length >= 2) {
-      const track = getTrack(trackMap, mergeList.value[0]);
-      const otherTrackIds = mergeList.value.slice(1);
-      track.merge(otherTrackIds.map((trackId) => getTrack(trackMap, trackId)));
+    if (multiSelectList.value.length >= 2) {
+      const targetTrackId = multiSelectList.value[0];
+      const otherTrackIds = multiSelectList.value.slice(1);
+      cameraStore.mergeTracks(targetTrackId, otherTrackIds);
       handleRemoveTrack(otherTrackIds, true);
       handleToggleMerge();
-      handleSelectTrack(track.trackId, false);
+      handleSelectTrack(targetTrackId, false);
     }
+  }
+
+  function handleStartLinking(camera: string) {
+    if (!linkingState.value && selectedTrackId.value !== null) {
+      linkingState.value = true;
+      if (cameraStore.camMap.value.has(camera)) {
+        linkingCamera.value = camera;
+      } else {
+        throw Error(`Camera: ${camera} does not exist in the system for linking`);
+      }
+    } else if (selectedTrackId.value === null) {
+      throw Error('Cannot start Linking without a track selected');
+    }
+  }
+
+  function handleStopLinking() {
+    linkingState.value = false;
+    linkingTrack.value = null;
+    linkingCamera.value = '';
+  }
+  /**
+   * Group: Add the currently selected track to a new group and
+   * enter group editing mode.
+   */
+  function handleAddGroup() {
+    if (selectedTrackId.value !== null) {
+      const members = [cameraStore.getTrack(selectedTrackId.value, selectedCamera.value)];
+      const groupStore = cameraStore.camMap.value.get(selectedCamera.value)?.groupStore;
+      if (groupStore) {
+        const newGrp = groupStore.add(members, groupSettings.value.newGroupSettings.type);
+        handleGroupEdit(newGrp.id);
+      }
+    }
+  }
+
+  /**
+   * Delete every track that is currently multi-selected.
+   */
+  async function handleDeleteSelectedTracks() {
+    if (editingMultiTrack.value) {
+      await handleRemoveTrack(multiSelectList.value, undefined, undefined, false);
+      selectedTrackId.value = null;
+    }
+  }
+
+  /**
+   * Group: Remove group ids and unselect everything.
+   */
+  function handleRemoveGroup(ids: AnnotationId[]) {
+    ids.forEach((groupId) => {
+      const groupStore = cameraStore.camMap.value.get(selectedCamera.value)?.groupStore;
+      if (groupStore) {
+        groupStore.remove(groupId);
+      }
+    });
+    /* Figure out next track ID */
+    const maybeNextGroupId = selectNextGroup(1);
+    const previousOrNext = maybeNextGroupId !== null
+      ? maybeNextGroupId
+      : selectNextGroup(-1);
+    handleEscapeMode();
+    handleGroupEdit(previousOrNext);
+  }
+
+  /**
+   * Save original track feature state before segmentation prediction modifies it.
+   * Used by handleSegmentationReset to restore the detection to its pre-segmentation state.
+   */
+  const preSegmentationFeatures = new Map<number, {
+    hadFeature: boolean;
+    bounds?: RectBounds;
+    interpolate?: boolean;
+    geometryFeatures?: GeoJSON.Feature[];
+    fishLength?: number;
+    attributes?: Feature['attributes'];
+    existingPolygonKeys?: Set<string>;
+  }>();
+
+  /**
+   * A mask is the detection's whole shape on that frame, so polygons from
+   * elsewhere (a text query, an import, a drawn one) go with it; a reset
+   * restores them.
+   */
+  function dropOtherPolygons(track: Track, frameNum: number) {
+    track.getPolygonFeatures(frameNum).forEach((existing) => {
+      if (existing.key !== SegmentationPolygonKey) {
+        track.removeFeatureGeometry(frameNum, { key: existing.key, type: 'Polygon' });
+      }
+    });
+  }
+
+  /**
+   * Segmentation prompt points for visualization (green=foreground, red=background)
+   */
+  const segmentationPoints: Ref<{ points: [number, number][]; labels: number[]; frameNum: number }> = ref({
+    points: [],
+    labels: [],
+    frameNum: -1,
+  });
+
+  /**
+   * Handle segmentation points update - update visual display of prompt points
+   */
+  function handleSegmentationPointsUpdated(data: { points: [number, number][]; labels: number[]; frameNum: number }) {
+    segmentationPoints.value = {
+      points: [...data.points],
+      labels: [...data.labels],
+      frameNum: data.frameNum,
+    };
+  }
+
+  /**
+   * A point-segmented mask is the first shape of a brand-new detection, so it
+   * gets the same auto-populate pass (head/tail from the mask) as a drawn box,
+   * again after every click that reshapes it. Refining an existing detection's
+   * mask does not.
+   */
+  function emitMaskGeometry(trackId: number, frameNum: number, polygons: SegmentationPolygon[]) {
+    if (!onNewAnnotationGeometry || polygons.length === 0
+      || preSegmentationFeatures.get(frameNum)?.hadFeature === true) return;
+    onNewAnnotationGeometry({
+      camera: selectedCamera.value,
+      trackId,
+      frameNum,
+      source: 'mask',
+      polygons,
+    });
+  }
+
+  /**
+   * Store a mask's components as keyed polygons on the detection, dropping the
+   * components of the previous prediction that this one no longer has.
+   */
+  function applySegmentationPolygons(
+    track: Track,
+    frameNum: number,
+    components: ReturnType<typeof segmentationComponents>,
+    bounds: RectBounds | null | undefined,
+  ) {
+    const polygons = segmentationPolygonFeatures(components, SegmentationPolygonKey);
+    const keys = new Set(polygons.map((polygon) => polygon.properties?.key));
+    track.getPolygonFeatures(frameNum).forEach((existing) => {
+      if (isSegmentationPolygonKey(existing.key, SegmentationPolygonKey) && !keys.has(existing.key)) {
+        track.removeFeatureGeometry(frameNum, { key: existing.key, type: 'Polygon' });
+      }
+    });
+    const { interpolate } = track.canInterpolate(frameNum);
+    track.setFeature({
+      frame: frameNum,
+      flick: 0,
+      bounds: bounds || componentsBounds(components),
+      keyframe: true,
+      interpolate,
+    }, polygons as GeoJSON.Feature<TrackSupportedFeature>[]);
+  }
+
+  /**
+   * Handle segmentation prediction ready - update visual display with pending polygon/mask.
+   * This is called when the segmentation model returns a prediction.
+   * During editing, we show the polygon preview but don't commit it yet.
+   */
+  function handleSegmentationPredictionReady(result: SegmentationPredictionResult, fromClick = false) {
+    if (selectedTrackId.value === null) {
+      return;
+    }
+
+    const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+    if (!track) {
+      return;
+    }
+
+    // Create polygon geometry from prediction result
+    const components = segmentationComponents(result);
+    if (components.length > 0) {
+      // Update the track's feature with the preview polygon
+      // Use frame number from the result if provided, otherwise current frame
+      const targetFrame = result.frameNum ?? selectedCameraFrame();
+
+      // Save original feature state before first prediction modifies the track
+      if (!preSegmentationFeatures.has(targetFrame)) {
+        const [existingFeature] = track.getFeature(targetFrame);
+        // Track which polygon keys existed before segmentation so reset can
+        // tell originals from segmentation-added polygons.
+        const existingPolygonKeys = new Set<string>();
+        if (existingFeature?.geometry?.features) {
+          existingFeature.geometry.features.forEach((f) => {
+            if (f.geometry.type === 'Polygon') {
+              existingPolygonKeys.add(f.properties?.key ?? '');
+            }
+          });
+        }
+        if (existingFeature) {
+          preSegmentationFeatures.set(targetFrame, {
+            hadFeature: true,
+            bounds: existingFeature.bounds
+              ? [...existingFeature.bounds] as RectBounds : undefined,
+            interpolate: existingFeature.interpolate,
+            geometryFeatures: existingFeature.geometry?.features
+              ? JSON.parse(JSON.stringify(existingFeature.geometry.features))
+              : undefined,
+            fishLength: existingFeature.fishLength,
+            attributes: existingFeature.attributes
+              ? JSON.parse(JSON.stringify(existingFeature.attributes))
+              : undefined,
+            existingPolygonKeys,
+          });
+        } else {
+          preSegmentationFeatures.set(targetFrame, { hadFeature: false, existingPolygonKeys });
+        }
+      }
+
+      dropOtherPolygons(track, targetFrame);
+      applySegmentationPolygons(track, targetFrame, components, result.bounds);
+
+      mirrorFeatureToAlignedCameras(track.id, targetFrame);
+
+      _nudgeEditingCanary();
+
+      if (result.controlPoints) emitMaskGeometry(track.id, targetFrame, components);
+
+      // Interactive stereo: as soon as the left polygon is predicted, generate
+      // the other-camera polygon + head/tail lines + measurement automatically,
+      // without waiting for the user to finalize the detection. Only fired for
+      // fresh predictions (controlPoints present), so navigating frames or
+      // restoring a pending preview does not re-trigger stereo work.
+      if (onStereoAnnotationComplete && stereoInteractiveActive()
+          && selectedTrackId.value !== null && result.controlPoints) {
+        onStereoAnnotationComplete({
+          type: 'segmentation',
+          camera: selectedCamera.value,
+          trackId: selectedTrackId.value as number,
+          frameNum: targetFrame,
+          points: result.controlPoints.points,
+          labels: result.controlPoints.labels,
+        });
+      }
+
+      // Continuous detection mode: each fresh foreground click commits its own
+      // detection, then immediately start a new one so the next click segments a
+      // new track instead of refining this one. controlPoints distinguishes a
+      // real click from a preview restored on frame navigation; fromClick
+      // excludes the right-click/Enter confirm path. Background (negative) clicks
+      // only make sense as refinements, so they do not spawn a new detection.
+      const { labels } = result.controlPoints ?? { labels: [] };
+      const lastPointForeground = labels.length > 0 && labels[labels.length - 1] !== 0;
+      if (fromClick && result.controlPoints && lastPointForeground
+        && trackSettings.value.newTrackSettings?.mode === 'Detection'
+        && trackSettings.value.newTrackSettings.modeSettings.Detection.continuous
+        && recipes.some((r) => r instanceof SegmentationPointClick && r.active.value)) {
+        preSegmentationFeatures.clear();
+        handleAddTrackOrDetection();
+      }
+    }
+  }
+
+  /**
+   * Handle segmentation prediction confirmed - commit the polygon to the track.
+   * This is called when the user confirms the segmentation (right-click or Enter).
+   */
+  function handleSegmentationPredictionConfirmed(result: SegmentationPredictionResult) {
+    // Each click already ran the stereo copy and auto-populate for this mask;
+    // confirming only commits it.
+    handleSegmentationPredictionReady({ ...result, controlPoints: undefined });
+  }
+
+  /** Click-path variant: a fresh point click that should honor continuous mode. */
+  function handleSegmentationPredictionReadyFromClick(result: SegmentationPredictionResult) {
+    handleSegmentationPredictionReady(result, true);
+  }
+
+  /**
+   * Handle multi-frame segmentation confirmation.
+   * Commits polygons for all frames that have valid predictions.
+   */
+  function handleSegmentationConfirmedMulti(result: MultiFrameSegmentationResult) {
+    if (selectedTrackId.value === null) {
+      return;
+    }
+
+    const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+    if (!track) {
+      return;
+    }
+
+    // Apply each frame's prediction to the track
+    result.frames.forEach((frameResult, frameNum) => {
+      const components = segmentationComponents(frameResult);
+      if (components.length > 0) {
+        dropOtherPolygons(track, frameNum);
+        applySegmentationPolygons(track, frameNum, components, frameResult.bounds);
+
+        mirrorFeatureToAlignedCameras(track.id, frameNum);
+
+        // Note: the other-camera (stereo) annotation is generated earlier, on
+        // each fresh prediction (handleSegmentationPredictionReady), so there is
+        // no need to regenerate it on confirm.
+        preSegmentationFeatures.delete(frameNum);
+      }
+    });
+
+    _nudgeEditingCanary();
+
+    if (onStereoSegmentationFinalize && selectedTrackId.value !== null) {
+      onStereoSegmentationFinalize({
+        trackId: selectedTrackId.value as number,
+        frameNums: Array.from(result.frames.keys()),
+      });
+    }
+  }
+
+  /**
+   * Handle segmentation prediction error - show error dialog to user
+   */
+  function handleSegmentationPredictionError(errorMessage: string) {
+    prompt({
+      title: 'Segmentation Error',
+      text: [errorMessage],
+    });
+  }
+
+  /**
+   * Restore one frame to its pre-segmentation snapshot (or delete the feature
+   * when the session created it). Full delete+setFeature avoids setFeature
+   * merge leftovers (head/tail, extra polygons) from looking "not reset".
+   */
+  function handleSegmentationReset(data: { frameNum: number }) {
+    if (selectedTrackId.value === null) return;
+    const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+    if (!track) return;
+
+    const saved = preSegmentationFeatures.get(data.frameNum);
+    if (!saved) return;
+
+    if (!saved.hadFeature) {
+      track.deleteFeature(data.frameNum);
+    } else {
+      track.deleteFeature(data.frameNum);
+      const origFeatures = (saved.geometryFeatures
+        ? JSON.parse(JSON.stringify(saved.geometryFeatures))
+        : []) as GeoJSON.Feature<TrackSupportedFeature>[];
+      track.setFeature({
+        frame: data.frameNum,
+        flick: 0,
+        bounds: saved.bounds,
+        keyframe: true,
+        interpolate: saved.interpolate ?? false,
+        fishLength: saved.fishLength,
+        attributes: saved.attributes
+          ? JSON.parse(JSON.stringify(saved.attributes))
+          : undefined,
+      }, origFeatures);
+    }
+
+    mirrorFeatureToAlignedCameras(track.id, data.frameNum);
+
+    if (onStereoAnnotationReset && stereoInteractiveActive()) {
+      onStereoAnnotationReset({
+        trackId: selectedTrackId.value as number,
+        frameNum: data.frameNum,
+        sourceCamera: selectedCamera.value,
+      });
+    }
+
+    preSegmentationFeatures.delete(data.frameNum);
+    _nudgeEditingCanary();
+  }
+
+  /**
+   * Clear every in-progress segmentation frame for the current detection.
+   * Recipe resetPoints emits this so Reset always drops the pending mask(s),
+   * not only frames the recipe still has prompt points for.
+   */
+  function handleSegmentationResetSession() {
+    [...preSegmentationFeatures.keys()].forEach((frameNum) => {
+      handleSegmentationReset({ frameNum });
+    });
+  }
+
+  /**
+   * Set up polygon recipe for adding a hole to an existing polygon.
+   * The recipe emits an activate event that triggers creation mode.
+   */
+  function handleAddHole() {
+    if (selectedTrackId.value === null) return;
+
+    const polygonRecipe = recipes.find((r) => r.name === 'PolygonBase');
+    if (polygonRecipe && 'setAddingHole' in polygonRecipe) {
+      (polygonRecipe as { setAddingHole: () => void }).setAddingHole();
+    }
+  }
+
+  /**
+   * Set up polygon recipe for adding a new separate polygon.
+   */
+  function handleAddPolygon() {
+    if (selectedTrackId.value === null) return;
+
+    const polygonRecipe = recipes.find((r) => r.name === 'PolygonBase');
+    if (polygonRecipe && 'setAddingPolygon' in polygonRecipe) {
+      const track = cameraStore.getPossibleTrack(selectedTrackId.value, selectedCamera.value);
+      if (track) {
+        const newKey = track.getNextPolygonKey(selectedCameraFrame());
+        (polygonRecipe as { setAddingPolygon: (key: string) => void }).setAddingPolygon(newKey);
+      }
+    }
+  }
+
+  /**
+   * Cancel any in-progress creation mode (hole or polygon addition).
+   */
+  function handleCancelCreation() {
+    const polygonRecipe = recipes.find((r) => r.name === 'PolygonBase');
+    if (polygonRecipe && 'resetAddingMode' in polygonRecipe) {
+      (polygonRecipe as { resetAddingMode: () => void }).resetAddingMode();
+    }
+  }
+
+  /** Drop tool previews without replaying segmentation reset over restored data. */
+  function prepareAnnotationUndo() {
+    preSegmentationFeatures.clear();
+    if (selectedTrackId.value !== null) _removeIfEmpty(selectedTrackId.value);
+    selectedTrackId.value = null;
+    recipes.forEach((recipe) => {
+      if (recipe instanceof SegmentationPointClick) recipe.resetPoints();
+    });
+    handleCancelCreation();
+    handleEscapeMode();
+    onStereoSegmentationFinalize?.();
+  }
+
+  /**
+   * Register a callback to finalize in-progress creation shapes.
+   * Called by LayerManager to connect the edit layer's finalize method.
+   */
+  function registerFinalizeCreation(cb: () => void) {
+    finalizeCreationCallback = cb;
   }
 
   /* Subscribe to recipe activation events */
   recipes.forEach((r) => r.bus.$on('activate', handleSetAnnotationState));
+
+  /* Subscribe to segmentation recipe events */
+  recipes.forEach((r) => {
+    if (r instanceof SegmentationPointClick) {
+      r.bus.$on('points-updated', handleSegmentationPointsUpdated);
+      r.bus.$on('prediction-ready', handleSegmentationPredictionReadyFromClick);
+      r.bus.$on('prediction-confirmed', handleSegmentationPredictionConfirmed);
+      r.bus.$on('prediction-confirmed-multi', handleSegmentationConfirmedMulti);
+      r.bus.$on('prediction-error', handleSegmentationPredictionError);
+      r.bus.$on('prediction-reset', handleSegmentationReset);
+      r.bus.$on('prediction-reset-session', handleSegmentationResetSession);
+    }
+  });
+
   /* Unsubscribe before unmount */
   onBeforeUnmount(() => {
+    if (typeof document !== 'undefined') document.removeEventListener('mousedown', countMouseDown, true);
     recipes.forEach((r) => r.bus.$off('activate', handleSetAnnotationState));
+    recipes.forEach((r) => {
+      if (r instanceof SegmentationPointClick) {
+        r.bus.$off('points-updated', handleSegmentationPointsUpdated);
+        r.bus.$off('prediction-ready', handleSegmentationPredictionReadyFromClick);
+        r.bus.$off('prediction-confirmed', handleSegmentationPredictionConfirmed);
+        r.bus.$off('prediction-confirmed-multi', handleSegmentationConfirmedMulti);
+        r.bus.$off('prediction-error', handleSegmentationPredictionError);
+        r.bus.$off('prediction-reset', handleSegmentationReset);
+        r.bus.$off('prediction-reset-session', handleSegmentationResetSession);
+      }
+    });
   });
 
   return {
+    selectedTrackId,
+    editingGroupId,
     editingMode,
+    editingTrack,
+    editingMultiTrack,
     editingDetails,
-    mergeList,
-    mergeInProgress,
+    linkingTrack,
+    linkingState,
+    linkingCamera,
+    multiSelectList,
+    multiSelectActive,
     visibleModes,
     selectedFeatureHandle,
     selectedKey,
+    selectedCamera,
+    selectNextTrack,
+    segmentationPoints,
     handler: {
       commitMerge: handleCommitMerge,
+      confirmRecipe: handleConfirmRecipe,
+      segmentationFinalizePending: handleSegmentationFinalizePending,
+      groupAdd: handleAddGroup,
+      deleteSelectedTracks: handleDeleteSelectedTracks,
+      groupEdit: handleGroupEdit,
       toggleMerge: handleToggleMerge,
       trackAdd: handleAddTrackOrDetection,
       trackAbort: handleEscapeMode,
+      prepareAnnotationUndo,
       trackEdit: handleTrackEdit,
       trackSeek: handleTrackClick,
       trackSelect: handleSelectTrack,
+      lassoSelect: handleLassoSelect,
       trackSelectNext: handleSelectNext,
-      trackTypeChange: handleTrackTypeChange,
+      setTrackFeature: handleSetTrackFeature,
       updateRectBounds: handleUpdateRectBounds,
       updateGeoJSON: handleUpdateGeoJSON,
       removeTrack: handleRemoveTrack,
       removePoint: handleRemovePoint,
       removeAnnotation: handleRemoveAnnotation,
+      removeGroup: handleRemoveGroup,
       selectFeatureHandle: handleSelectFeatureHandle,
       setAnnotationState: handleSetAnnotationState,
       unstageFromMerge: handleUnstageFromMerge,
+      startLinking: handleStartLinking,
+      stopLinking: handleStopLinking,
+      seekFrame,
+      addHole: handleAddHole,
+      addPolygon: handleAddPolygon,
+      cancelCreation: handleCancelCreation,
+      registerFinalizeCreation,
     },
   };
 }

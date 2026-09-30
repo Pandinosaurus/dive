@@ -1,14 +1,14 @@
 <script lang="ts">
 import {
   computed, defineComponent, Ref, ref, PropType,
-} from '@vue/composition-api';
+} from 'vue';
 import { GirderFileManager, GirderModelType } from '@girder/components/src';
 import useRequest from 'dive-common/use/useRequest';
 import { RootlessLocationType } from 'platform/web-girder/store/types';
-import { GirderMetadataStatic } from 'platform/web-girder/constants';
+import { GirderConfigStatic } from 'platform/web-girder/constants';
 import { useGirderRest } from 'platform/web-girder/plugins/girder';
 import { clone, getDataset } from 'platform/web-girder/api';
-
+import { useRouter } from 'vue-router/composables';
 
 export default defineComponent({
   components: { GirderFileManager },
@@ -33,9 +33,10 @@ export default defineComponent({
     },
   },
 
-  setup(props, { root }) {
+  setup(props) {
     const girderRest = useGirderRest();
-    const source = ref(null as GirderMetadataStatic | null);
+    const router = useRouter();
+    const source = ref(null as GirderConfigStatic | null);
     const open = ref(false);
     const location: Ref<RootlessLocationType> = ref({
       _modelType: ('user' as GirderModelType),
@@ -73,7 +74,7 @@ export default defineComponent({
         parentFolderId: location.value._id,
         revision: props.revision,
       });
-      root.$router.push({ name: 'viewer', params: { id: newDataset.data._id } });
+      router.push({ name: 'viewer', params: { id: newDataset.data._id } });
     });
 
     return {
@@ -151,6 +152,12 @@ export default defineComponent({
       </v-card-title>
       <v-card-text>
         <v-alert
+          v-if="revision"
+          type="info"
+        >
+          Revision {{ revision }} selected.
+        </v-alert>
+        <v-alert
           v-if="cloneError"
           type="error"
           dismissible
@@ -179,7 +186,8 @@ export default defineComponent({
             :location="location"
             @update:location="setLocation"
           >
-            <template #row-widget="{item}">
+            <template #row="{ item }">
+              <span>{{ item.name }}</span>
               <v-chip
                 v-if="(item.meta && item.meta.annotate)"
                 color="white"

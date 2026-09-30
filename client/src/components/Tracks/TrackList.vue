@@ -1,0 +1,716 @@
+<script lang="ts">
+import Vue, {
+  defineComponent, reactive, computed, ref,
+  watch,
+} from 'vue';
+
+import { usePrompt } from 'dive-common/vue-utilities/prompt-service';
+import { AnnotationId } from 'vue-media-annotator/BaseAnnotation';
+import { TrackWithContext, ThresholdScope } from 'vue-media-annotator/BaseFilterControls';
+import type { TrackProjection } from 'vue-media-annotator/TrackProjection';
+
+import { clientSettings } from 'dive-common/store/settings';
+import {
+  useEditingMode,
+  useHandler,
+  useSelectedTrackId,
+  useTrackFilters,
+  useTime,
+  useReadOnlyMode,
+  useTrackStyleManager,
+  useMultiSelectList,
+  useCameraStore,
+  usePendingSaveCount,
+} from '../../provides';
+import useVirtualScrollTo from '../../use/useVirtualScrollTo';
+import { getSuppressedTrackIds, suppressionTypeResolver } from '../../use/suppression';
+import SideBarTrackListView from './sidebar/SideBarTrackListView.vue';
+import BottomBarTrackListView from './bottombar/BottomBarTrackListView.vue';
+
+/* Magic numbers involved in height calculation */
+const TrackListHeaderHeight = 52;
+
+type SortKey = 'id' | 'start' | 'end' | 'startTime' | 'endTime' | 'confidence' | 'type' | 'notes' | string;
+type SortDirection = 'asc' | 'desc';
+
+export default defineComponent({
+  name: 'TrackList',
+
+  components: {
+    SideBarTrackListView,
+    BottomBarTrackListView,
+  },
+
+  props: {
+    newTrackMode: {
+      type: String,
+      required: true,
+    },
+    newTrackType: {
+      type: String,
+      required: true,
+    },
+    lockTypes: {
+      type: Boolean,
+      default: false,
+    },
+    hotkeysDisabled: {
+      type: Boolean,
+      required: true,
+    },
+    height: {
+      type: Number,
+      default: 420,
+    },
+    disabled: {
+      type: Boolean,
+      default: false,
+    },
+    compact: {
+      type: Boolean,
+      default: false,
+    },
+    fps: {
+      type: Number,
+      default: null,
+    },
+  },
+
+  setup(props) {
+    const { prompt } = usePrompt();
+    const readOnlyMode = useReadOnlyMode();
+    const trackFilters = useTrackFilters();
+    const allTypesRef = trackFilters.allTypes;
+    const checkedTrackIdsRef = trackFilters.checkedIDs;
+    const editingModeRef = useEditingMode();
+    const selectedTrackIdRef = useSelectedTrackId();
+    const cameraStore = useCameraStore();
+    const pendingSaveCount = usePendingSaveCount();
+    const filteredTracksRef = trackFilters.filteredAnnotations;
+    const typeStylingRef = useTrackStyleManager().typeStyling;
+    const { frame: frameRef, isPlaying } = useTime();
+    const multiSelectList = useMultiSelectList();
+    const {
+      trackSplit, removeTrack, trackAdd, trackSelect, trackSelectNext,
+    } = useHandler();
+
+    const data = reactive({
+      itemHeight: props.compact ? 50 : 70, // in pixels
+      settingsActive: false,
+      columnSettingsActive: false,
+      showDeleteAll: false,
+      deleteAllScope: 'all' as ThresholdScope,
+    });
+
+    const sortKey = ref<SortKey>('id');
+    const sortDirection = ref<SortDirection>('asc');
+
+    const displayConfidence = (
+      track: TrackProjection,
+      contextIndex: number,
+    ) => {
+      const pairIndex = trackFilters.hierarchyActive.value ? contextIndex : 0;
+      return track.confidencePairs[pairIndex]?.[1] ?? 0;
+    };
+    const suppressionResolutionRef = computed(() => suppressionTypeResolver(trackFilters));
+
+    const filterDetectionsByFrame = ref(clientSettings.trackSettings.trackListSettings.filterDetectionsByFrame);
+    watch(
+      () => clientSettings.trackSettings.trackListSettings.filterDetectionsByFrame,
+      (newValue) => {
+        filterDetectionsByFrame.value = newValue;
+      },
+    );
+
+    /** Same per-frame / suppression visibility the list uses when frame filtering is on. */
+    function isListedAtCurrentFrame(trackId: number): boolean {
+      const editRevision = pendingSaveCount.value;
+      const suppType = clientSettings.typeSettings.suppressionType;
+      const suppThreshold = clientSettings.typeSettings.suppressionThreshold;
+      const suppressionResolver = suppressionResolutionRef.value;
+      const suppressedByCamera = new Map<string, Set<number>>();
+      cameraStore.camMap.value.forEach(({ trackStore }, cameraName) => {
+        suppressedByCamera.set(
+          cameraName,
+          (editRevision >= 0)
+            ? getSuppressedTrackIds(
+              trackStore,
+              frameRef.value,
+              suppType,
+              suppThreshold,
+              { revision: editRevision, resolver: suppressionResolver },
+            )
+            : new Set<number>(),
+        );
+      });
+      let visible = false;
+      cameraStore.camMap.value.forEach(({ trackStore }, cameraName) => {
+        if (visible) {
+          return;
+        }
+        if (suppressedByCamera.get(cameraName)?.has(trackId)) {
+          return;
+        }
+        const possibleTrack = trackStore.getPossible(trackId);
+        if (!possibleTrack) {
+          return;
+        }
+        const [feature] = possibleTrack.getFeature(frameRef.value);
+        if (feature && feature.keyframe) {
+          visible = true;
+        }
+      });
+      return visible;
+    }
+
+    const finalFilteredTracks = computed<TrackWithContext[]>(() => {
+      let tracks = filteredTracksRef.value;
+      if (trackFilters.hierarchyActive.value) {
+        tracks = tracks.filter(({ annotation, context }) => (
+          annotation.confidencePairs[context.confidencePairIndex] !== undefined
+        ));
+      }
+      if (filterDetectionsByFrame.value && !isPlaying.value) {
+        // Depend on the edit counter so moving a suppression region re-runs the
+        // filter (geometry mutations are not reactive track-set changes).
+        tracks = tracks.filter((track) => isListedAtCurrentFrame(track.annotation.id));
+      }
+
+      // Helper to get notes from a track's first keyframe
+      function getTrackNotes(track: TrackProjection): string {
+        // Try direct access first (most common case)
+        const directFeature = track.features[track.begin];
+        if (directFeature && directFeature.notes && directFeature.notes.length > 0) {
+          return directFeature.notes.join(', ');
+        }
+        // If no feature at begin or no notes, try to get the first available feature
+        const [real, lower, upper] = track.getFeature(track.begin);
+        const fallbackFeature = real || lower || upper;
+        if (fallbackFeature && fallbackFeature.notes && fallbackFeature.notes.length > 0) {
+          return fallbackFeature.notes.join(', ');
+        }
+        return '';
+      }
+
+      // Helper to get attribute value from a track
+      function getTrackAttributeValue(
+        track: TrackProjection,
+        attrKey: string,
+      ): string | number | undefined {
+        // Check if it's a track attribute (track_*) or detection attribute (detection_*)
+        const isTrackAttr = attrKey.startsWith('track_');
+        const actualKey = attrKey.replace(/^(track_|detection_)/, '');
+
+        if (isTrackAttr) {
+          // Track-level attribute
+          if (track.attributes && track.attributes[actualKey] !== undefined) {
+            return track.attributes[actualKey] as string | number;
+          }
+        } else {
+          // Detection-level attribute - get from first keyframe
+          const feature = track.features[track.begin];
+          if (feature && feature.attributes && feature.attributes[actualKey] !== undefined) {
+            return feature.attributes[actualKey] as string | number;
+          }
+        }
+        return undefined;
+      }
+
+      // Apply sorting
+      const sorted = [...tracks];
+      const direction = sortDirection.value === 'asc' ? 1 : -1;
+
+      // Projections copy the whole feature history, so build one per track rather than
+      // one per comparison: the comparator runs O(n log n) times over the same n tracks.
+      const projections = new Map<AnnotationId, TrackProjection>();
+      tracks.forEach(({ annotation }) => {
+        try {
+          projections.set(annotation.id, cameraStore.getTrackProjection(annotation.id));
+        } catch {
+          // Track vanished between filtering and sorting; comparisons involving it are ties.
+        }
+      });
+
+      sorted.sort((a, b) => {
+        const trackA = projections.get(a.annotation.id);
+        const trackB = projections.get(b.annotation.id);
+        if (!trackA || !trackB) {
+          return 0;
+        }
+
+        const key = sortKey.value;
+
+        // Check if sorting by an attribute column
+        if (key.startsWith('track_') || key.startsWith('detection_')) {
+          const valA = getTrackAttributeValue(trackA, key);
+          const valB = getTrackAttributeValue(trackB, key);
+          const emptyA = valA === undefined || valA === '';
+          const emptyB = valB === undefined || valB === '';
+          // Empty values go last in ascending, first in descending
+          if (emptyA && !emptyB) return direction;
+          if (!emptyA && emptyB) return -direction;
+          if (emptyA && emptyB) return 0;
+          // Numeric comparison if both are numbers
+          if (typeof valA === 'number' && typeof valB === 'number') {
+            return (valA - valB) * direction;
+          }
+          // String comparison otherwise
+          return String(valA).localeCompare(String(valB)) * direction;
+        }
+
+        switch (key) {
+          case 'id':
+            return (trackA.trackId - trackB.trackId) * direction;
+          case 'start':
+          case 'startTime':
+            return (trackA.begin - trackB.begin) * direction;
+          case 'end':
+          case 'endTime':
+            return (trackA.end - trackB.end) * direction;
+          case 'confidence': {
+            const confA = displayConfidence(trackA, a.context.confidencePairIndex);
+            const confB = displayConfidence(trackB, b.context.confidencePairIndex);
+            return (confA - confB) * direction;
+          }
+          case 'type': {
+            const typeA = trackA.getType(a.context.confidencePairIndex)[0];
+            const typeB = trackB.getType(b.context.confidencePairIndex)[0];
+            const typeCompare = typeA.localeCompare(typeB);
+            if (typeCompare !== 0) return typeCompare * direction;
+            // Secondary sort by confidence within same type
+            const confA = displayConfidence(trackA, a.context.confidencePairIndex);
+            const confB = displayConfidence(trackB, b.context.confidencePairIndex);
+            return (confA - confB) * direction;
+          }
+          case 'notes': {
+            const notesA = getTrackNotes(trackA);
+            const notesB = getTrackNotes(trackB);
+            const emptyA = notesA === '';
+            const emptyB = notesB === '';
+            // Empty notes go last in ascending, first in descending
+            if (emptyA && !emptyB) return direction;
+            if (!emptyA && emptyB) return -direction;
+            if (emptyA && emptyB) return 0;
+            return notesA.localeCompare(notesB) * direction;
+          }
+          default:
+            return 0;
+        }
+      });
+      return sorted;
+    });
+
+    const virtualListItems = computed(() => {
+      const selectedTrackId = selectedTrackIdRef.value;
+      const multiSelect = multiSelectList.value;
+      const checkedTrackIds = checkedTrackIdsRef.value;
+      const editingMode = editingModeRef.value;
+      const allTypes = allTypesRef.value;
+      return finalFilteredTracks.value.map((filtered) => ({
+        filteredTrack: filtered,
+        selectedTrackId,
+        checkedTrackIds,
+        multiSelect,
+        editingTrack: !!editingMode,
+        allTypes,
+      }));
+    });
+
+    const getAnnotation = (id: AnnotationId) => cameraStore.getAnyPossibleTrack(id);
+
+    watch(
+      () => filteredTracksRef.value,
+      (newValue) => {
+        if (newValue.length === 0) {
+          trackSelect(null, false);
+        }
+      },
+    );
+
+    const virtualScroll = useVirtualScrollTo({
+      itemHeight: data.itemHeight,
+      getAnnotation,
+      filteredListRef: finalFilteredTracks,
+      selectedIdRef: selectedTrackIdRef,
+      multiSelectList,
+      selectNext: (delta) => trackSelectNext(
+        delta,
+        finalFilteredTracks.value.map((filtered) => filtered.annotation),
+      ),
+    });
+
+    /** Template refs cannot be passed as props (Vue unwraps them to null). */
+    function setVirtualListRef(instance: Vue | null): void {
+      virtualScroll.virtualList.value = instance;
+    }
+
+    function getItemProps(item: typeof virtualListItems.value[number]) {
+      const confidencePair = item.filteredTrack.annotation.getType(
+        item.filteredTrack.context.confidencePairIndex,
+      );
+      const trackType = confidencePair;
+      const selected = item.selectedTrackId === item.filteredTrack.annotation.id;
+      const track = cameraStore.getTrackProjection(item.filteredTrack.annotation.id);
+      return {
+        trackType,
+        track,
+        inputValue: item.checkedTrackIds.includes(item.filteredTrack.annotation.id),
+        selected,
+        secondarySelected: item.multiSelect.includes(item.filteredTrack.annotation.id),
+        editing: selected && item.editingTrack,
+        color: typeStylingRef.value.color(trackType),
+        types: item.allTypes,
+        displayPairIndex: trackFilters.hierarchyActive.value
+          ? item.filteredTrack.context.confidencePairIndex
+          : 0,
+      };
+    }
+
+    function checkedDisplayedTracks() {
+      return virtualListItems.value
+        .map((item) => item.filteredTrack.annotation.id)
+        .filter((id) => checkedTrackIdsRef.value.includes(id));
+    }
+
+    /* 'above' is the listed tracks themselves; 'below' reaches the tracks of
+       the enabled types that the confidence thresholds hide from the list. */
+    function confirmDeleteAll() {
+      data.showDeleteAll = false;
+      const scope = data.deleteAllScope;
+      const types = [...trackFilters.checkedTypes.value];
+      const ids = new Set(scope === 'below' ? [] : checkedDisplayedTracks());
+      if (scope !== 'above') {
+        let below = trackFilters.annotationIdsBelowThreshold(types);
+        // Match the list's frame / suppression visibility when that filter is on.
+        if (filterDetectionsByFrame.value && !isPlaying.value) {
+          below = below.filter((id) => isListedAtCurrentFrame(id));
+        }
+        below.forEach((id) => ids.add(id));
+      }
+      // Use the same track deletion path for every scope (including group and selection cleanup).
+      removeTrack([...ids], true);
+    }
+
+    async function multiDelete() {
+      if (virtualListItems.value.length > 0
+        && checkedDisplayedTracks().length === virtualListItems.value.length) {
+        data.deleteAllScope = 'all';
+        data.showDeleteAll = true;
+        return;
+      }
+      const tracksDisplayed: number[] = [];
+      const text = ['Do you want to delete the following tracks:'];
+      let count = 0;
+      const limit = 20;
+      virtualListItems.value.forEach((item) => {
+        if (item.checkedTrackIds.includes(item.filteredTrack.annotation.id)) {
+          if (count < limit) {
+            text.push(item.filteredTrack.annotation.id.toString());
+          }
+          tracksDisplayed.push(item.filteredTrack.annotation.id);
+          count += 1;
+        }
+      });
+      if (count >= limit) {
+        text.push(`And ${count - limit} more tracks...`);
+      }
+
+      const result = await prompt({
+        title: 'Confirm',
+        text,
+        confirm: true,
+      });
+      if (result) {
+        removeTrack(tracksDisplayed, true);
+      }
+    }
+
+    const mouseTrap = computed(() => {
+      const disabled = props.hotkeysDisabled;
+      return [
+        {
+          bind: 'up',
+          handler: (el: HTMLElement, event: KeyboardEvent) => {
+            virtualScroll.scrollPreventDefault(el, event, 'up');
+          },
+          disabled,
+        },
+        {
+          bind: 'down',
+          handler: (el: HTMLElement, event: KeyboardEvent) => {
+            virtualScroll.scrollPreventDefault(el, event, 'down');
+          },
+          disabled,
+        },
+        {
+          bind: 'del',
+          handler: () => {
+            if (!readOnlyMode.value && selectedTrackIdRef.value !== null) {
+              removeTrack([selectedTrackIdRef.value]);
+            }
+          },
+          disabled,
+        },
+        {
+          bind: 'x',
+          handler: () => !readOnlyMode.value
+          && trackSplit(selectedTrackIdRef.value, frameRef.value),
+          disabled,
+        },
+      ];
+    });
+
+    const virtualHeight = computed(() => props.height - TrackListHeaderHeight);
+
+    function handleSort(key: SortKey) {
+      if (sortKey.value === key) {
+        // Toggle direction between desc and asc
+        sortDirection.value = sortDirection.value === 'desc' ? 'asc' : 'desc';
+      } else {
+        // New sort key starts with descending
+        sortKey.value = key;
+        sortDirection.value = 'desc';
+      }
+    }
+
+    const sortIcon = computed(() => (key: SortKey) => {
+      if (sortKey.value !== key) return '';
+      return sortDirection.value === 'asc' ? 'mdi-chevron-up' : 'mdi-chevron-down';
+    });
+
+    return {
+      allTypes: allTypesRef,
+      data,
+      getItemProps,
+      mouseTrap,
+      filteredTracks: finalFilteredTracks,
+      trackAdd,
+      virtualHeight,
+      virtualListItems,
+      setVirtualListRef,
+      multiDelete,
+      confirmDeleteAll,
+      sortKey,
+      sortDirection,
+      handleSort,
+      sortIcon,
+    };
+  },
+});
+</script>
+
+<template>
+  <bottom-bar-track-list-view
+    v-if="compact"
+    :data="data"
+    :filtered-tracks="filteredTracks"
+    :new-track-mode="newTrackMode"
+    :new-track-type="newTrackType"
+    :track-add="trackAdd"
+    :multi-delete="multiDelete"
+    :confirm-delete-all="confirmDeleteAll"
+    :virtual-list-items="virtualListItems"
+    :get-item-props="getItemProps"
+    :lock-types="lockTypes"
+    :disabled="disabled"
+    :fps="fps"
+    :set-virtual-list-ref="setVirtualListRef"
+    :mouse-trap="mouseTrap"
+    :virtual-height="virtualHeight"
+    :sort-key="sortKey"
+    :handle-sort="handleSort"
+    :sort-icon="sortIcon"
+    @track-seek="$emit('track-seek', $event)"
+  >
+    <template #settings>
+      <slot name="settings" />
+    </template>
+    <template #column-settings>
+      <slot name="column-settings" />
+    </template>
+    <template #header-trailing>
+      <slot name="header-trailing" />
+    </template>
+  </bottom-bar-track-list-view>
+  <side-bar-track-list-view
+    v-else
+    :data="data"
+    :filtered-tracks="filteredTracks"
+    :new-track-mode="newTrackMode"
+    :new-track-type="newTrackType"
+    :track-add="trackAdd"
+    :multi-delete="multiDelete"
+    :confirm-delete-all="confirmDeleteAll"
+    :virtual-list-items="virtualListItems"
+    :get-item-props="getItemProps"
+    :lock-types="lockTypes"
+    :disabled="disabled"
+    :fps="fps"
+    :set-virtual-list-ref="setVirtualListRef"
+    :mouse-trap="mouseTrap"
+    :virtual-height="virtualHeight"
+    @track-seek="$emit('track-seek', $event)"
+  >
+    <template #settings>
+      <slot name="settings" />
+    </template>
+  </side-bar-track-list-view>
+</template>
+
+<style lang="scss">
+.strcoller {
+  height: 100%;
+}
+.trackHeader{
+  height: auto;
+}
+.compact-header {
+  background-color: #262626;
+  border-bottom: 1px solid #444;
+  flex-shrink: 0;
+  min-height: 28px;
+}
+.compact-header-text {
+  font-size: 14px;
+  font-weight: 600;
+}
+.compact-column-headers {
+  /* The header is padded 8px more than the rows; without this every label sits right of its column */
+  margin-left: -8px;
+
+  .col-header {
+    font-size: 10px;
+    color: #888;
+    text-transform: uppercase;
+    font-weight: 500;
+
+    &.sortable {
+      cursor: pointer;
+      user-select: none;
+
+      &:hover {
+        color: #fff;
+      }
+
+      &.active {
+        color: #80c6e8;
+      }
+
+      .v-icon {
+        vertical-align: middle;
+        margin-left: 1px;
+      }
+    }
+  }
+  .col-spacer {
+    /* Matches track-lead-compact (checkbox or color box): 24px + 6px margin */
+    min-width: 30px;
+  }
+  .col-id {
+    /* Matches trackNumber-compact: 30px + 8px margin, centered like its values */
+    width: 30px;
+    min-width: 30px;
+    flex-shrink: 0;
+    margin-right: 8px;
+  }
+  .col-type {
+    /* Matches track-type-compact: 80px */
+    min-width: 80px;
+  }
+  .col-conf {
+    /* Match the value's content width and keep its trailing gap separate. */
+    width: 40px;
+    min-width: 40px;
+    flex-shrink: 0;
+    margin-right: 8px;
+    text-align: center;
+  }
+  .col-start {
+    /* Matches track-frame-start: 45px */
+    min-width: 45px;
+    text-align: right;
+  }
+  .col-end {
+    /* Matches track-frame-end: 45px + 8px margin */
+    min-width: 45px;
+    text-align: right;
+    margin-right: 8px;
+  }
+  .col-timestamp {
+    min-width: 70px;
+    text-align: right;
+    margin-right: 8px;
+  }
+  .col-attribute {
+    width: 100px;
+    min-width: 100px;
+    flex-shrink: 0;
+    max-width: 100px;
+    text-align: left;
+    margin-right: 8px;
+  }
+  .col-length {
+    /* Matches track-length: a number needs less room than free text */
+    width: 64px;
+    min-width: 64px;
+    max-width: 64px;
+  }
+  .col-id,
+  .col-conf,
+  .col-length {
+    position: relative;
+    text-align: center;
+
+    .v-icon {
+      position: absolute;
+      right: -8px;
+      top: 50%;
+      transform: translateY(-50%);
+    }
+  }
+  .col-notes {
+    flex-grow: 1;
+    min-width: 60px;
+    margin-left: 12px;
+  }
+  .col-actions {
+    min-width: 100px;
+    text-align: right;
+  }
+}
+.tracks {
+  overflow-y: auto;
+  overflow-x: hidden;
+
+  .v-input--checkbox {
+    label {
+      white-space: pre-wrap;
+    }
+  }
+}
+
+.tracks-compact {
+  overflow-y: scroll;
+  overflow-x: hidden;
+
+  /* Always show scrollbar */
+  &::-webkit-scrollbar {
+    width: 8px;
+  }
+  &::-webkit-scrollbar-track {
+    background: #1e1e1e;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+  }
+  &::-webkit-scrollbar-thumb:hover {
+    background: #666;
+  }
+}
+
+/* Above timeline current-frame bar (z-index: 10) */
+.track-settings-menu-content {
+  z-index: 999;
+}
+</style>

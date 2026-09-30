@@ -1,7 +1,7 @@
 import type { GirderModel } from '@girder/components/src';
 import girderRest from 'platform/web-girder/plugins/girder';
 
-function deleteResources(resources: Array<GirderModel>) {
+function deleteResources(resources: Array<Pick<GirderModel, '_id' | '_modelType'>>) {
   const formData = new FormData();
   formData.set(
     'resources',
@@ -17,9 +17,13 @@ function deleteResources(resources: Array<GirderModel>) {
   return girderRest.delete('resource', { data: formData });
 }
 
-function getItemsInFolder(folderId: string, limit: number) {
+function deleteItem(itemId: string) {
+  return girderRest.delete(`item/${itemId}`);
+}
+
+function getItemsInFolder(folderId: string, limit: number, offset = 0) {
   return girderRest.get<GirderModel[]>('item', {
-    params: { folderId, limit },
+    params: { folderId, limit, offset },
   });
 }
 
@@ -37,9 +41,34 @@ function setUsePrivateQueue(userId: string, value = false) {
   });
 }
 
+async function getSharedWithMeFolders(
+  limit?: number,
+  offset?: number,
+  sort?: string,
+  sortdir?: number,
+  onlyNonAccessibles: boolean = true,
+) {
+  const response = await girderRest.get<GirderModel[]>('folder/shared-folders', {
+    params: {
+      limit,
+      offset,
+      sort,
+      sortdir,
+      onlyNonAccessibles,
+    },
+  });
+  response.data.forEach((element) => {
+    // eslint-disable-next-line no-param-reassign
+    element._modelType = 'folder';
+  });
+  return response;
+}
+
 export {
   deleteResources,
+  deleteItem,
   getItemsInFolder,
   getFolder,
   setUsePrivateQueue,
+  getSharedWithMeFolders,
 };

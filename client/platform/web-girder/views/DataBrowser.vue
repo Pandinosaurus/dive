@@ -1,32 +1,45 @@
 <script lang="ts">
 import {
   computed, defineComponent, ref, onBeforeUnmount,
-} from '@vue/composition-api';
+} from 'vue';
 import {
-  GirderFileManager, getLocationType, GirderModel,
+  getLocationType, GirderModel,
 } from '@girder/components/src';
 import { itemsPerPageOptions } from 'dive-common/constants';
+import {
+  getMultiCamIcon,
+  getMultiCamSubType,
+  getMultiCamTooltip,
+} from 'dive-common/multicamDisplay';
 import { clientSettings } from 'dive-common/store/settings';
-import { useStore, LocationType } from '../store/types';
+import { LocationType } from '../store/types';
+import { useLocation } from '../store/useLocation';
+import { useJobs } from '../store/useJobs';
 import Upload from './Upload.vue';
 import eventBus from '../eventBus';
+import { reportHandledPromiseRejection } from '../reportHandledPromiseRejection';
+
+import DiveGirderBrowser from './DiveGirderBrowser.vue';
 
 export default defineComponent({
   components: {
-    GirderFileManager,
+    DiveGirderBrowser,
     Upload,
   },
 
   setup() {
     const fileManager = ref();
-    const store = useStore();
     const uploading = ref(false);
     const uploaderDialog = ref(false);
-    const locationStore = store.state.Location;
-    const { getters } = store;
+    const {
+      location, selected, locationIsViameFolder, setRouteFromLocation,
+    } = useLocation();
+    const jobs = useJobs();
 
-    function setLocation(location: LocationType) {
-      store.dispatch('Location/setRouteFromLocation', location);
+    function setLocation(loc: LocationType) {
+      setRouteFromLocation(loc).catch((reason) => {
+        reportHandledPromiseRejection('DataBrowser: setRouteFromLocation', reason);
+      });
     }
 
     function handleNotification() {
@@ -45,11 +58,25 @@ export default defineComponent({
       return item._modelType === 'folder' && item.meta.annotate;
     }
 
+    function multiCamSubType(item: GirderModel) {
+      return getMultiCamSubType(item.meta);
+    }
+
+    function multiCamIcon(item: GirderModel) {
+      const subType = multiCamSubType(item);
+      return subType ? getMultiCamIcon(subType) : '';
+    }
+
+    function multiCamTooltip(item: GirderModel) {
+      const subType = multiCamSubType(item);
+      return subType ? getMultiCamTooltip(subType) : '';
+    }
+
     const shouldShowUpload = computed(() => (
-      locationStore.location
-      && !getters['Location/locationIsViameFolder']
-      && getLocationType(locationStore.location) === 'folder'
-      && !locationStore.selected.length
+      location.value
+      && !locationIsViameFolder.value
+      && getLocationType(location.value) === 'folder'
+      && !selected.value.length
     ));
 
     eventBus.$on('refresh-data-browser', handleNotification);
@@ -59,8 +86,10 @@ export default defineComponent({
 
     return {
       fileManager,
-      locationStore,
-      getters,
+      location,
+      selected,
+      locationIsViameFolder,
+      jobs,
       shouldShowUpload,
       uploaderDialog,
       uploading,
@@ -68,6 +97,9 @@ export default defineComponent({
       itemsPerPageOptions,
       /* methods */
       isAnnotationFolder,
+      multiCamSubType,
+      multiCamIcon,
+      multiCamTooltip,
       handleNotification,
       setLocation,
       updateUploading,
@@ -76,16 +108,15 @@ export default defineComponent({
 });
 </script>
 
-
 <template>
-  <GirderFileManager
+  <DiveGirderBrowser
     ref="fileManager"
-    v-model="locationStore.selected"
-    :selectable="!getters['Location/locationIsViameFolder']"
+    v-model="selected"
+    :selectable="!locationIsViameFolder"
     :new-folder-enabled="
-      !locationStore.selected.length && !getters['Location/locationIsViameFolder']
+      !selected.length && !locationIsViameFolder
     "
-    :location="locationStore.location"
+    :location="location"
     :items-per-page.sync="clientSettings.rowsPerPage"
     :items-per-page-options="itemsPerPageOptions"
     @update:location="setLocation($event)"
@@ -97,7 +128,7 @@ export default defineComponent({
         max-width="800px"
         :persistent="uploading"
       >
-        <template #activator="{on}">
+        <template #activator="{ on }">
           <v-btn
             class="ma-0"
             text
@@ -114,50 +145,78 @@ export default defineComponent({
           </v-btn>
         </template>
         <Upload
-          :location="locationStore.location"
+          v-if="location"
+          :location="location"
           @update:uploading="updateUploading"
           @close="uploaderDialog = false"
         />
       </v-dialog>
     </template>
-    <template #row-widget="{item}">
-      <v-icon
-        v-if="getters['Jobs/datasetRunningState'](item._id)"
-        color="warning"
-        class="rotate"
-      >
-        mdi-autorenew
-      </v-icon>
-      <v-btn
-        v-if="isAnnotationFolder(item)"
-        class="ml-2"
-        x-small
-        color="primary"
-        depressed
-        :to="{ name: 'viewer', params: { id: item._id } }"
-      >
-        Launch Annotator
-      </v-btn>
-      <v-chip
-        v-if="(item.meta && item.meta.foreign_media_id)"
-        color="white"
-        x-small
-        outlined
-        disabled
-        class="my-0 mx-3"
-      >
-        cloned
-      </v-chip>
-      <v-chip
-        v-if="(item.meta && item.meta.published)"
-        color="green"
-        x-small
-        outlined
-        disabled
-        class="my-0 mx-3"
-      >
-        published
-      </v-chip>
+    <template #row="{ item }">
+      <div class="dataset-row">
+        <v-tooltip
+          v-if="multiCamSubType(item)"
+          bottom
+        >
+          <template #activator="{ on, attrs }">
+            <v-icon
+              small
+              class="mr-1"
+              v-bind="attrs"
+              v-on="on"
+            >
+              {{ multiCamIcon(item) }}
+            </v-icon>
+          </template>
+          <span>{{ multiCamTooltip(item) }}</span>
+        </v-tooltip>
+        <span>{{ item.name }}</span>
+        <v-icon
+          v-if="jobs.getDatasetRunningState(item._id)"
+          color="warning"
+          class="rotate ml-2"
+        >
+          mdi-autorenew
+        </v-icon>
+        <v-btn
+          v-if="isAnnotationFolder(item)"
+          class="ml-2"
+          x-small
+          color="primary"
+          depressed
+          :to="{ name: 'viewer', params: { id: item._id } }"
+        >
+          Launch Annotator
+        </v-btn>
+        <v-chip
+          v-if="(item.foreign_media_id)"
+          color="white"
+          x-small
+          outlined
+          disabled
+          class="my-0 mx-3"
+        >
+          cloned
+        </v-chip>
+        <v-chip
+          v-if="(item.meta && item.meta.published)"
+          color="green"
+          x-small
+          outlined
+          disabled
+          class="my-0 mx-3"
+        >
+          published
+        </v-chip>
+      </div>
     </template>
-  </GirderFileManager>
+  </DiveGirderBrowser>
 </template>
+
+<style lang="scss" scoped>
+.dataset-row {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+</style>

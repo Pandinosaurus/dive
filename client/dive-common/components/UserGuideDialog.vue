@@ -1,21 +1,47 @@
+<script lang="ts">
+import { defineComponent } from 'vue';
+import isDesktopRuntime from 'dive-common/isDesktopRuntime';
 
-<script>
-export default {
-  props: {
-    state: {
-      type: String,
-      require: true,
-      default: 'default',
-    },
-  },
-  data() {
+export default defineComponent({
+  setup() {
+    const desktopShortcuts = isDesktopRuntime() ? [{
+      name: 'Text Query',
+      icon: 'mdi-keyboard',
+      actions: ['Q Key'],
+      description: 'Open the SAM3 text query dialog to find objects by description in the current frame',
+    }] : [];
+
     return {
       categories: [
         {
           name: 'General',
           data: [
             {
+              name: 'Undo Annotation Change',
+              icon: 'mdi-undo',
+              actions: ['Ctrl + Z', 'Cmd + Z (Mac)'],
+              description: 'Undo the last annotation edit, creation or deletion. Text fields keep normal text undo.',
+            },
+            {
               name: 'Select Track', icon: 'mdi-mouse', actions: ['Left Click Mouse'], description: 'Left click a rectangle to select a detection/track',
+            },
+            {
+              name: 'Multi-select Track',
+              icon: 'mdi-mouse',
+              actions: ['Ctrl + Left Click Mouse'],
+              description: 'Add or remove a track from multi-selection for bulk edit',
+            },
+            {
+              name: 'Lasso Select',
+              icon: 'mdi-mouse',
+              actions: ['Alt + Mouse Drag'],
+              description: 'Draw around tracks to multi-select; release the mouse to confirm',
+            },
+            {
+              name: 'Lasso Add to Selection',
+              icon: 'mdi-mouse',
+              actions: ['Ctrl + Alt + Mouse Drag'],
+              description: 'Lasso-select tracks and add them to the current multi-selection',
             },
             {
               name: 'Zoom In/Out', icon: 'mdi-mouse', actions: ['Scrollwheel Up/Down'], description: 'use scrollwheel to zoom in and out',
@@ -52,14 +78,18 @@ export default {
             {
               name: 'Toggle Interpolation', icon: 'mdi-keyboard', actions: ['I'], description: 'Toggle Interpolation On/Off',
             },
-
+            {
+              name: 'Toggle Interpolation All', icon: 'mdi-keyboard', actions: ['CTRL+I'], description: 'Toggle Interpolation On/Off for all Frames',
+            },
             {
               name: 'Split Track', icon: 'mdi-keyboard', actions: ['X'], description: 'Split Track',
             },
             {
               name: 'Merge Mode', icon: 'mdi-keyboard', actions: ['M'], description: 'Enter Merge Mode, commit with Shift+M',
             },
-
+            {
+              name: 'Create Group', icon: 'mdi-keyboard', actions: ['G'], description: 'Create group from selected track.',
+            },
           ],
         },
         {
@@ -88,13 +118,15 @@ export default {
             {
               name: 'Add Head/Tail', icon: 'mdi-keyboard', actions: ['H Key - Head', 'T Key - Tail'], description: 'While a track is selected add head/tail annotations',
             },
+            ...desktopShortcuts,
           ],
         },
       ],
     };
   },
-};
+});
 </script>
+
 <template>
   <div class="d-flex justify-space-around flex-wrap pa-4">
     <v-card
@@ -113,7 +145,7 @@ export default {
         color="red"
         top
       >
-        <template v-slot:activator="{ on }">
+        <template #activator="{ on }">
           <v-row
             class="helpContextRow ma-0 align-center"
             v-on="on"
@@ -139,8 +171,8 @@ export default {
     </v-card>
   </div>
 </template>
-<style lang="scss" scoped>
 
+<style lang="scss" scoped>
 #helpdialog{
   font-family: monospace;
   font-size: 12px;

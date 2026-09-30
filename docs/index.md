@@ -7,7 +7,7 @@
 
 This is the documentation site for DIVE, a [**free and open-source**](https://www.kitware.com/open-philosophy/) annotation and analysis platform for web and desktop built by [Kitware](https://kitware.com). DIVE integrates with the [VIAME toolkit](https://www.viametoolkit.org/), but it can also be used on its own.
 
-[:material-compass: Try the web version](Web-Version.md){ .md-button } [:material-desktop-mac: Get the desktop app](Dive-Desktop.md){ .md-button } [:material-lifebuoy: Get support](Support.md){ .md-button }
+[:material-compass: Try the web version](Web-Version.md){ .md-button } [:fontawesome-solid-desktop: Get the desktop app](Dive-Desktop.md){ .md-button } [:material-lifebuoy: Get support](Support.md){ .md-button }
 
 
 ![Home](images/Banner.png)
@@ -16,26 +16,40 @@ This is the documentation site for DIVE, a [**free and open-source**](https://ww
 
 |         | Web | Desktop |
 |---------|-----|---------|
-| **Data Support** |
+| **Data** |
 Load your own images and videos | ✔️ | ✔️
 | &nbsp;&nbsp;&nbsp; Image and video transcoding | ✔️ | ✔️
 | &nbsp;&nbsp;&nbsp; Import using image lists  | ❌ | ✔️
-Load annotations from [supported formats](DataFormats) | ✔️ | ✔️
+Multicamera and stereo datasets | ✔️ | ✔️
+| &nbsp;&nbsp;&nbsp; Batch multicam import (collect folders) | ✔️ | ✔️
+| &nbsp;&nbsp;&nbsp; Timestamp-aligned multicam playback | ✔️ | ✔️
+Load annotations from [supported formats](DataFormats.md) | ✔️ | ✔️
 Create new object and track annotation | ✔️ | ✔️
 Annotation export | ✔️ | ✔️
 Dataset export for portability between web and desktop | ✔️ | ✔️
 Permissions and sharing support for team collaboration | ✔️ | ❌
-| **Annotation Support** |
+| **Annotation** |
 Bounding boxes | ✔️ | ✔️
 Polygons | ✔️ | ✔️
 Head/Tail lines | ✔️ | ✔️
 Linear interpolation | ✔️ | ✔️
 Track split | ✔️ | ✔️
 Multi-way track merge | ✔️ | ✔️
-| **VIAME Integration Support** |
+Complex Interactions and activity groups | ✔️ | ✔️
+Freeform or multi-select attributes | ✔️ | ✔️
+| &nbsp;&nbsp;&nbsp; Interactive point-click segmentation | ❌ | ✔️
+| &nbsp;&nbsp;&nbsp; Interactive stereo (warp / length recompute) | ❌ | ✔️
+| **Data Review** |
+Image enhancement (brightness, contrast, saturation, sharpness) | ✔️ | ✔️
+| &nbsp;&nbsp;&nbsp; Percentile stretch for high bit-depth TIFF | ✔️ (large-image) | ✔️ (image-sequence)
+Advanced per-type annotation confidence threshoding | ✔️ | ✔️
+Review save history and load previous states | ✔️ | ❌
+Multiple parallel annotation sets on one dataset | ✔️ | ❌
+| **VIAME Integration** |
 Run VIAME object detection and tracking | ✔️ | ✔️
 Run VIAME detector and tracker **training** | ✔️ | ✔️
-VIAME multi-camera pipelines  | ❌ | ✔️
+VIAME multi-camera pipelines  | ✔️ | ✔️
+Score computed annotations against ground truth | ✔️ | ✔️
 Manual refinement of auto-generated annotations | ✔️ | ✔️
 
 ## Concepts and Definitions
@@ -52,6 +66,8 @@ Manual refinement of auto-generated annotations | ✔️ | ✔️
 
 **Track** - A collection of detections spanned over multiple frames in a video or image sequence.  Tracks include a start and end time and can have gap periods in which no detections exist.
 
+**Group** - A collection of one or more tracks, which can be given a definite frame range, type annotation, confidence, and attributes.
+ 
 **Types** - Every track (or detection, if tracks aren't applicable) has one or more types that should be used to annotate the primary characteristic you are interested in classifying.  Types are typically used to train a single or multi-class classifier.  A track (or detection) may have multiple types with confidence values associated.
 
 **Frame** - A single image or point in time for a video or image sequence.
@@ -61,3 +77,5 @@ Manual refinement of auto-generated annotations | ✔️ | ✔️
 **Interpolation** - The implicit bounding boxes between keyframes in a track.
 
 **Attributes** - Attributes are free-form secondary characteristics on both tracks and detections. For example, a `fish` type track may have an `is_adult` boolean attribute.
+
+**Suppression** - A review feature that hides detections under configured ignore regions, or visually flags detections that carry a suppression attribute, while excluding them from type counts. See [Suppression](UI-Suppression.md).

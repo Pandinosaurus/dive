@@ -1,15 +1,19 @@
-from typing import List
+from typing import List, Optional
 
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
 from girder.api.rest import Resource
 from girder.constants import AccessType
+from girder.exceptions import RestException
 from girder.models.folder import Folder
+from girder.models.item import Item
 from girder.models.token import Token
 
-from dive_utils.types import PipelineDescription
+from dive_utils import asbool, fromMeta
+from dive_utils.constants import DatasetMarker, FPSMarker, MarkForPostProcess, TypeMarker
+from dive_utils.types import PipelineDescription, PipelineParams, TrainingModelTuneArgs
 
-from . import crud, crud_rpc
+from . import crud, crud_rpc, model_pack, worker_capabilities
 
 
 class RpcResource(Resource):
@@ -20,8 +24,27 @@ class RpcResource(Resource):
         self.resourceName = resourceName
 
         self.route("POST", ("pipeline",), self.run_pipeline_task)
+        self.route("POST", ("export",), self.export_pipeline_onnx)
+        self.route("POST", ("model", "import"), self.import_model_pack)
         self.route("POST", ("train",), self.run_training)
+        self.route("POST", ("score",), self.run_scoring)
         self.route("POST", ("postprocess", ":id"), self.postprocess)
+        self.route("POST", ("convert_dive", ":id"), self.convert_dive)
+        self.route("POST", ("convert_large_image", ":id"), self.convert_large_image)
+        self.route("POST", ("batch_postprocess", ":id"), self.batch_postprocess)
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Import a ZIP containing pipelines and model weights").param(
+            "archive", "Model pack ZIP", dataType="file", required=True
+        )
+    )
+    def import_model_pack(self, archive):
+        if not getattr(archive, 'file', None):
+            raise RestException('A model ZIP file is required.', code=400)
+        return model_pack.import_model_pack(
+            self.getCurrentUser(), archive.file, archive.filename or 'model.zip'
+        )
 
     @access.user
     @autoDescribeRoute(
@@ -34,20 +57,78 @@ class RpcResource(Resource):
             required=True,
             level=AccessType.WRITE,
         )
+        .param(
+            "forceTranscoded",
+            "Force using the transcoded instead of source media",
+            paramType="query",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
         .jsonParam("pipeline", "The pipeline to run on the dataset", required=True)
+        .jsonParam(
+            "pipelineParams",
+            "Optional pipeline parameter groups (kwiverParams and runtimeParams)",
+            required=False,
+            default=None,
+        )
     )
-    def run_pipeline_task(self, folder, pipeline: PipelineDescription):
-        return crud_rpc.run_pipeline(self.getCurrentUser(), folder, pipeline)
+    def run_pipeline_task(
+        self,
+        folder,
+        forceTranscoded,
+        pipeline: PipelineDescription,
+        pipelineParams: Optional[PipelineParams],
+    ):
+        worker_capabilities.require_pipeline_worker()
+        return crud_rpc.run_pipeline(
+            self.getCurrentUser(), folder, pipeline, forceTranscoded, pipelineParams
+        )
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Export pipeline to ONNX")
+        .modelParam(
+            "modelFolderId",
+            destName='modelFolderId',
+            description="Folder id in which the model to export is located",
+            model=Folder,
+            paramType="query",
+            required=True,
+            level=AccessType.READ,
+        )
+        .modelParam(
+            "exportFolderId",
+            destName='exportFolderId',
+            description="Folder id to which the model will be exported",
+            model=Folder,
+            paramType="query",
+            required=True,
+            level=AccessType.WRITE,
+        )
+    )
+    def export_pipeline_onnx(self, modelFolderId, exportFolderId):
+        worker_capabilities.require_pipeline_worker()
+        return crud_rpc.export_trained_pipeline(
+            self.getCurrentUser(), modelFolderId, exportFolderId
+        )
 
     @access.user
     @autoDescribeRoute(
         Description("Run training on a folder")
         .jsonParam(
             "body",
-            description="JSON object with Array of folderIds to run training on\
-             and labels.txt file content",
+            description=(
+                "JSON object with Array of folderIds to run training on"
+                " and labels.txt file content.  Optionally a model that can be used"
+                " for fine tune training"
+            ),
             paramType="body",
-            schema={"folderIds": List[str], "labelText": str},
+            schema={
+                "folderIds": List[str],
+                "labelText": str,
+                "model": Optional[TrainingModelTuneArgs],
+            },
         )
         .param(
             "pipelineName",
@@ -69,14 +150,49 @@ class RpcResource(Resource):
             default=False,
             required=False,
         )
+        .param(
+            "forceTranscoded",
+            "Force using the transcoded instead of source media",
+            paramType="query",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
     )
-    def run_training(self, body, pipelineName, config, annotatedFramesOnly):
+    def run_training(self, body, pipelineName, config, annotatedFramesOnly, forceTranscoded):
+        worker_capabilities.require_training_worker()
         user = self.getCurrentUser()
         token = Token().createToken(user=user, days=14)
         run_training_args = crud.get_validated_model(crud_rpc.RunTrainingArgs, **body)
         return crud_rpc.run_training(
-            user, token, run_training_args, pipelineName, config, annotatedFramesOnly
+            user,
+            token,
+            run_training_args,
+            pipelineName,
+            config,
+            annotatedFramesOnly,
+            forceTranscoded,
         )
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Score a list of sequence pairs together with viame score").jsonParam(
+            "body",
+            description=(
+                "schema: RunScoringArgs. Each pair's computed and truth name a dataset plus an "
+                "optional annotation set and revision; the result is stored on the first "
+                "pair's computed dataset."
+            ),
+            paramType="body",
+            requireObject=True,
+        )
+    )
+    def run_scoring(self, body):
+        worker_capabilities.require_pipeline_worker()
+        user = self.getCurrentUser()
+        token = Token().createToken(user=user, days=14)
+        run_scoring_args = crud.get_validated_model(crud_rpc.RunScoringArgs, **body)
+        return crud_rpc.run_scoring(user, token, run_scoring_args)
 
     @access.user
     @autoDescribeRoute(
@@ -95,6 +211,154 @@ class RpcResource(Resource):
             default=False,
             required=False,
         )
+        .param(
+            "skipTranscoding",
+            "Whether to skip processing that might dispatch worker jobs",
+            paramType="formData",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
+        .param(
+            "additive",
+            "Whether to add new annotations to existing ones",
+            paramType="formData",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
+        .param(
+            "additivePrepend",
+            "When using additive the prepend to types: 'prepend_type'",
+            paramType="formData",
+            dataType="string",
+            default='',
+            required=False,
+        )
+        .param(
+            "set",
+            "Custom set name for any annotations that are loaded",
+            paramType="formData",
+            dataType="string",
+            default='',
+            required=False,
+        )
     )
-    def postprocess(self, folder, skipJobs):
-        return crud_rpc.postprocess(self.getCurrentUser(), folder, skipJobs)
+    def postprocess(self, folder, skipJobs, skipTranscoding, additive, additivePrepend, set):
+        return crud_rpc.postprocess(
+            self.getCurrentUser(), folder, skipJobs, skipTranscoding, additive, additivePrepend, set
+        )
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Post-processing to be run after media/annotation import")
+        .modelParam(
+            "id",
+            description="Item ID containing the file to process",
+            model=Item,
+            level=AccessType.WRITE,
+        )
+        .param(
+            "skipJobs",
+            "Whether to skip processing that might dispatch worker jobs",
+            paramType="formData",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
+        .param(
+            "skipTranscoding",
+            "Whether to skip processing that might dispatch worker jobs",
+            paramType="formData",
+            dataType="boolean",
+            default=True,
+            required=False,
+        )
+    )
+    def convert_dive(self, item, skipJobs, skipTranscoding):
+        # Get the parent folder and create a new subFolder then move the item into that folder.
+        parentFolder = Folder().findOne({"_id": item["folderId"]})
+        user = self.getCurrentUser()
+        if parentFolder:
+            foldername = f'Video {item["name"]}'
+            destFolder = Folder().createFolder(
+                parentFolder, foldername, creator=user, reuseExisting=True
+            )
+            Item().move(item, destFolder)
+            if not asbool(fromMeta(destFolder, DatasetMarker)):
+                destFolder["meta"].update(
+                    {
+                        TypeMarker: 'video',
+                        FPSMarker: -1,  # auto calculate the FPS from import
+                    }
+                )
+                Folder().save(destFolder)
+                crud_rpc.postprocess(self.getCurrentUser(), destFolder, skipJobs, skipTranscoding)
+            return str(destFolder['_id'])
+        return ''
+
+    def get_marked_for_postprocess(self, folder, user, datasets, limit):
+        subFolders = list(Folder().childFolders(folder, 'folder', user))
+        for child in subFolders:
+            if child.get('meta', {}).get(MarkForPostProcess, False):
+                if len(datasets) < limit:
+                    datasets.append(child)
+                else:
+                    return
+            self.get_marked_for_postprocess(child, user, datasets, limit)
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Convert folder of images to large images").modelParam(
+            "id",
+            description="Folder containing the items to process",
+            model=Folder,
+            level=AccessType.WRITE,
+        )
+    )
+    def convert_large_image(self, folder):
+        worker_capabilities.require_jobs_enabled()
+        return crud_rpc.convert_large_image(self.getCurrentUser(), folder)
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Post-processing for after S3 Imports")
+        .modelParam(
+            "id",
+            description="Folder containing the items to process",
+            model=Folder,
+            level=AccessType.WRITE,
+        )
+        .param(
+            "skipJobs",
+            "Whether to skip processing that might dispatch worker jobs",
+            paramType="formData",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
+        .param(
+            "skipTranscoding",
+            "Whether to skip processing that might dispatch worker jobs",
+            paramType="formData",
+            dataType="boolean",
+            default=False,
+            required=False,
+        )
+        .param(
+            "limit",
+            "Number of Jobs to start to attempt to convert to DIVE format",
+            paramType="formData",
+            dataType="integer",
+            default=100,
+            required=False,
+        )
+    )
+    def batch_postprocess(self, folder, skipJobs, skipTranscoding, limit):
+        # get a list of possible Datasets
+        datasets = []
+        self.get_marked_for_postprocess(folder, self.getCurrentUser(), datasets, limit)
+        for subFolder in datasets:
+            subFolder['meta']['MarkForPostProcess'] = False
+            Folder().save(subFolder)
+            crud_rpc.postprocess(self.getCurrentUser(), subFolder, skipJobs, skipTranscoding)

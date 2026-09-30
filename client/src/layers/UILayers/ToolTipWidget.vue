@@ -1,8 +1,8 @@
 <script lang="ts">
 import {
   defineComponent, PropType, Ref,
-} from '@vue/composition-api';
-import { StateStyles } from '../../use/useStyling';
+} from 'vue';
+import { StateStyles } from '../../StyleManager';
 import { ToolTipWidgetData } from './UILayerTypes';
 /*
   This Component will be mounted indepedently of the main Vue App
@@ -66,7 +66,16 @@ export default defineComponent({
         >
           █
         </span>
-        <span>{{ `${item.type}:${item.confidence.toFixed(2)}` }}</span>
+        <span>{{ item.type }}</span>
+        <v-icon
+          v-if="item.suppressed"
+          x-small
+          class="mx-1"
+          :title="`Flagged suppressed (${item.suppressed})`"
+        >
+          mdi-eye-off
+        </v-icon>
+        <span>{{ `:${item.confidence.toFixed(2)}` }}</span>
       </div>
     </div>
   </v-card>

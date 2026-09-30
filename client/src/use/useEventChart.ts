@@ -1,17 +1,20 @@
+import { computed, Ref } from 'vue';
+import type { AnnotationWithContext } from '../BaseFilterControls';
+import type { TypeStyling } from '../StyleManager';
+import BaseAnnotation, { AnnotationId } from '../BaseAnnotation';
+import type Track from '../track';
+import type { TrackProjection } from '../TrackProjection';
+import { Group } from '..';
 
-import { computed, Ref } from '@vue/composition-api';
-import { TrackWithContext } from './useTrackFilters';
-import { TrackId } from '../track';
-import { TypeStyling } from './useStyling';
-
-interface EventChartParams {
-  enabledTracks: Readonly<Ref<readonly TrackWithContext[]>>;
-  selectedTrackIds: Ref<TrackId[]>;
+interface EventChartParams<T extends BaseAnnotation> {
+  enabledTracks: Readonly<Ref<AnnotationWithContext<OneOf<T, [Group, Track]>>[]>>;
+  selectedTrackIds: Ref<AnnotationId[]>;
   typeStyling: Ref<TypeStyling>;
+  getTrackProjection: (id: AnnotationId) => TrackProjection;
 }
 
-interface EventChartData {
-  trackId: TrackId;
+export interface EventChartData {
+  id: AnnotationId;
   name: string;
   type: string;
   color: string;
@@ -20,28 +23,33 @@ interface EventChartData {
   markers: [number, boolean][];
 }
 
-export default function useEventChart({
-  enabledTracks, selectedTrackIds, typeStyling,
-}: EventChartParams) {
+export default function useEventChart<T extends BaseAnnotation>({
+  enabledTracks, selectedTrackIds, typeStyling, getTrackProjection,
+}: EventChartParams<T>) {
   const eventChartData = computed(() => {
     const values = [] as EventChartData[];
     const mapfunc = typeStyling.value.color;
     const selectedTrackIdsValue = selectedTrackIds.value;
     /* use forEach rather than filter().map() to save an interation */
     enabledTracks.value.forEach((filtered) => {
-      const { track } = filtered;
+      const { annotation: track } = filtered;
       const { confidencePairs } = track;
+      let markers: [number, boolean][] = [];
+      if (selectedTrackIds.value.includes(filtered.annotation.id)) {
+        const projection = getTrackProjection(filtered.annotation.id);
+        markers = projection.featureIndex.map((i) => (
+          [i, projection.features[i]?.interpolate || false]));
+      }
       if (confidencePairs.length) {
-        const trackType = track.getType(filtered.context.confidencePairIndex)[0];
+        const trackType = track.getType(filtered.context.confidencePairIndex);
         values.push({
-          trackId: track.trackId,
-          name: `Track ${track.trackId}`,
+          id: track.id,
+          name: `Track ${track.id}`,
           type: trackType,
           color: mapfunc(trackType),
-          selected: selectedTrackIdsValue.includes(track.trackId),
+          selected: selectedTrackIdsValue.includes(track.id),
           range: [track.begin, track.end],
-          markers: track.featureIndex.map((i) => (
-            [i, track.features[i].interpolate || false])),
+          markers,
         });
       }
     });

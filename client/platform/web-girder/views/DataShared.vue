@@ -1,13 +1,18 @@
 <script lang="ts">
 import {
   defineComponent, ref, reactive, watch, toRefs,
-} from '@vue/composition-api';
+} from 'vue';
 import type { DataOptions } from 'vuetify';
 import { GirderModel, mixins } from '@girder/components/src';
 import { clientSettings } from 'dive-common/store/settings';
 import { itemsPerPageOptions } from 'dive-common/constants';
-import { getDatasetList } from '../api';
-import { useStore, LocationType } from '../store/types';
+import {
+  getMultiCamIcon,
+  getMultiCamSubType,
+  getMultiCamTooltip,
+} from 'dive-common/multicamDisplay';
+import { getSharedWithMeFolders } from '../api';
+import { useLocation } from '../store/useLocation';
 
 export default defineComponent({
   name: 'DataShared',
@@ -19,13 +24,13 @@ export default defineComponent({
       sortBy: ['created'],
       sortDesc: [true],
     } as DataOptions);
-    const store = useStore();
-    const { getters } = store;
-    const locationStore = store.state.Location;
+    const {
+      location, selected, locationIsViameFolder,
+    } = useLocation();
 
     const headers = [
       { text: 'File Name', value: 'name' },
-      { text: '', value: 'annotator', sortable: false },
+      { text: 'Type', value: 'type' },
       { text: 'File Size', value: 'formattedSize' },
       { text: 'Shared By', value: 'ownerLogin' },
     ];
@@ -41,22 +46,33 @@ export default defineComponent({
       const offset = (page - 1) * clientSettings.rowsPerPage;
       const sort = sortBy[0] || 'created';
       const sortDir = sortDesc[0] === false ? 1 : -1;
-      const shared = true;
-      const response = await getDatasetList(limit, offset, sort, sortDir, shared);
+      const response = await getSharedWithMeFolders(limit, offset, sort, sortDir);
       dataList.value = response.data;
       total.value = Number.parseInt(response.headers['girder-total-count'], 10);
       dataList.value.forEach((element) => {
         // eslint-disable-next-line no-param-reassign
         element.formattedSize = fixSize.formatSize(element.size);
+        // eslint-disable-next-line no-param-reassign
+        element.type = isAnnotationFolder(element) ? 'Dataset' : 'Folder';
       });
     };
 
-    function setLocation(location: LocationType) {
-      store.dispatch('Location/setRouteFromLocation', location);
-    }
-
     function isAnnotationFolder(item: GirderModel) {
       return item._modelType === 'folder' && item.meta.annotate;
+    }
+
+    function multiCamSubType(item: GirderModel) {
+      return getMultiCamSubType(item.meta);
+    }
+
+    function multiCamIcon(item: GirderModel) {
+      const subType = multiCamSubType(item);
+      return subType ? getMultiCamIcon(subType) : '';
+    }
+
+    function multiCamTooltip(item: GirderModel) {
+      const subType = multiCamSubType(item);
+      return subType ? getMultiCamTooltip(subType) : '';
     }
 
     watch(tableOptions, updateOptions, {
@@ -67,12 +83,15 @@ export default defineComponent({
     updateOptions();
     return {
       isAnnotationFolder,
+      multiCamSubType,
+      multiCamIcon,
+      multiCamTooltip,
       dataList,
-      getters,
       updateOptions,
-      setLocation,
       total,
-      locationStore,
+      location,
+      selected,
+      locationIsViameFolder,
       clientSettings,
       itemsPerPageOptions,
       ...toRefs(tableOptions),
@@ -85,9 +104,8 @@ export default defineComponent({
 
 <template>
   <v-data-table
-    v-model="locationStore.selected"
-    :selectable="!getters['Location/locationIsViameFolder']"
-    :location="locationStore.location"
+    v-model="selected"
+    :selectable="!locationIsViameFolder"
     :headers="headers"
     :page.sync="page"
     :items-per-page.sync="clientSettings.rowsPerPage"
@@ -98,11 +116,37 @@ export default defineComponent({
     :footer-props="{ itemsPerPageOptions }"
     item-key="_id"
     show-select
-    @input="$emit('input', $event)"
-    @update:location="setLocation"
   >
     <!-- eslint-disable-next-line -->
-    <template v-slot:item.annotator="{item}">
+    <template v-slot:item.name="{ item }">
+      <div
+        class="filename"
+        @click="$router.push({ name: 'home', params: { routeType: 'folder', routeId: item._id } })"
+      >
+        <v-tooltip
+          v-if="multiCamSubType(item)"
+          bottom
+        >
+          <template #activator="{ on, attrs }">
+            <v-icon
+              small
+              class="mr-1"
+              v-bind="attrs"
+              v-on="on"
+            >
+              {{ multiCamIcon(item) }}
+            </v-icon>
+          </template>
+          <span>{{ multiCamTooltip(item) }}</span>
+        </v-tooltip>
+        <v-icon class="mr-1">
+          mdi-folder{{ item.public ? '' : '-key' }}
+        </v-icon>
+        {{ item.name }}
+      </div>
+    </template>
+    <template #item.type="{ item }">
+      {{ item.type }}
       <v-btn
         v-if="isAnnotationFolder(item)"
         class="ml-2"
@@ -120,3 +164,16 @@ export default defineComponent({
     </template>
   </v-data-table>
 </template>
+
+<style lang="scss" scoped>
+.filename {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  opacity: 0.8;
+
+  &:hover {
+    opacity: 1;
+  }
+}
+</style>

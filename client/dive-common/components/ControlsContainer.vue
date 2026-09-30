@@ -1,17 +1,28 @@
 <script lang="ts">
 import {
-  defineComponent, ref, PropType,
-} from '@vue/composition-api';
+  defineComponent, ref, PropType, computed, watch,
+  Ref,
+  reactive,
+} from 'vue';
 import type { DatasetType } from 'dive-common/apispec';
 import FileNameTimeDisplay from 'vue-media-annotator/components/controls/FileNameTimeDisplay.vue';
-import { injectMediaController } from 'vue-media-annotator/components/annotators/useMediaController';
 import {
   Controls,
   EventChart,
+  injectAggregateController,
   LineChart,
   Timeline,
 } from 'vue-media-annotator/components';
-
+import { clientSettings } from 'dive-common/store/settings';
+import context from 'dive-common/store/context';
+import {
+  useHandler,
+  useAttributesFilters,
+  useCameraRegistration,
+  useCameraStore,
+  useSelectedCamera,
+  useTime,
+} from '../../src/provides';
 
 export default defineComponent({
   components: {
@@ -21,7 +32,6 @@ export default defineComponent({
     LineChart,
     Timeline,
   },
-
   props: {
     lineChartData: {
       type: Array as PropType<unknown[]>,
@@ -31,53 +41,207 @@ export default defineComponent({
       type: Object as PropType<unknown>,
       required: true,
     },
+    groupChartData: {
+      type: Object as PropType<unknown>,
+      required: true,
+    },
     datasetType: {
       type: String as PropType<DatasetType>,
       required: true,
     },
+    collapsed: {
+      type: Boolean,
+      default: false,
+    },
+    isDefaultImage: {
+      type: Boolean as PropType<boolean>,
+      required: true,
+    },
+    bottomLayout: {
+      type: Boolean,
+      default: false,
+    },
+    wrapBottomControls: {
+      type: Boolean,
+      default: false,
+    },
   },
-
-  setup() {
+  setup(_, { emit }) {
+    const handler = useHandler();
     const currentView = ref('Detections');
-    const collapsed = ref(false);
+    const ticks = ref([0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    const cameraStore = useCameraStore();
+    const multiCam = ref(cameraStore.camMap.value.size > 1);
+    const selectedCamera = useSelectedCamera();
+    const activeCountSettings = ref(false);
+    const countView: Ref<'tracks' | 'detections'> = ref(clientSettings.timelineCountSettings.defaultView);
+    const help = reactive({
+      countType: 'Swap between counting tracks vs counting detections',
+      showTotal: 'In the graph show a line for the total counts',
+    });
 
-    const ticks = ref([0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0]);
-
+    const hasGroups = computed(
+      () => !!cameraStore.camMap.value.get(selectedCamera.value)?.groupStore.sorted.value.length,
+    );
+    const { timelineEnabled, attributeTimelineData } = useAttributesFilters();
+    // Format the Attribute data if it is available
+    const attributeData = computed(() => {
+      if (timelineEnabled.value) {
+        let startFrame = Infinity;
+        let endFrame = -Infinity;
+        attributeTimelineData.value.forEach((item) => {
+          startFrame = Math.min(startFrame, item.minFrame);
+          endFrame = Math.max(endFrame, item.maxFrame);
+        });
+        const timelineData = attributeTimelineData.value.map((item) => item.data);
+        return {
+          startFrame,
+          endFrame,
+          data: timelineData,
+        };
+      }
+      return null;
+    });
     /**
      * Toggles on and off the individual timeline views
      * Resizing is handled by the Annator itself.
      */
-    function toggleView(type: 'Detections' | 'Events') {
+    function toggleView(type: 'Detections' | 'Events' | 'Groups' | 'Attributes') {
       currentView.value = type;
-      collapsed.value = false;
+      emit('update:collapsed', false);
     }
-    const {
-      maxFrame, frame, seek, volume, setVolume, setSpeed, speed,
-    } = injectMediaController();
+    watch(timelineEnabled, () => {
+      if (!timelineEnabled.value && currentView.value === 'Attributes') {
+        toggleView('Events');
+      }
+    });
 
+    const toggleCountView = () => {
+      if (countView.value === 'detections') {
+        countView.value = 'tracks';
+      } else {
+        countView.value = 'detections';
+      }
+      clientSettings.timelineCountSettings.defaultView = countView.value;
+    };
+
+    function handleSelectTrack(trackId: number, modifiers?: { ctrl: boolean }) {
+      handler.trackSelect(trackId, false, modifiers);
+    }
+
+    const aggregateController = injectAggregateController();
+    const {
+      volume, setVolume, setSpeed, speed,
+    } = aggregateController.value;
+    /**
+     * Registration-frame markers for the Timeline work-area, shown ONLY
+     * while the Camera Registration panel is open (the same signal the
+     * viewer's registrationActive keys off) -- outside that tab the timeline
+     * stays exactly as it is today.
+     *
+     * Observation frames are camA-local, but the Timeline draws in the
+     * SELECTED camera's local frame space. Those two spaces only coincide
+     * when the rig drops no frames (or when camA happens to be selected):
+     * a rig whose cameras drop frames independently accumulates an offset,
+     * putting every marker a frame or two off. Translate through the aligned
+     * timeline, and drop markers whose capture has no frame on the selected
+     * camera -- there is no honest place to draw those.
+     */
+    const cameraRegistration = useCameraRegistration();
+    const registrationMarkers = computed(() => {
+      if (context.state.active !== 'CameraRegistration') {
+        return [];
+      }
+      const key = cameraRegistration.activePairKey();
+      // Touch observations so edits recompute the markers.
+      // eslint-disable-next-line no-void
+      void cameraRegistration.observations.value;
+      if (!key) {
+        return [];
+      }
+      const [camA] = key.split('::');
+      const target = selectedCamera.value;
+      return cameraRegistration.framesForPair(key)
+        // Only frames that actually carry points. A producer records the
+        // candidates it considered and discarded too (auto-register proposes
+        // more frames than it matches, then prunes) -- those have no points
+        // and nothing to toggle, so a marker for them is just noise on the
+        // scrubber. The frame list still lists them with their skip reason.
+        .filter((row) => row.frame !== null && row.count > 0)
+        .map((row) => ({
+          frame: aggregateController.value.translateCameraFrame(camA, row.frame as number, target),
+          enabled: row.enabled,
+        }))
+        .filter((marker): marker is { frame: number; enabled: boolean } => (
+          marker.frame !== undefined
+        ));
+    });
+    // The timeline charts (line/event charts) are built from trackStores in
+    // the selected camera's own local frame space. Under an aligned timeline
+    // (SEAL feature 5) the aggregate controller's frame/maxFrame/seek operate
+    // in global slot space, which diverges from local frames -- so the
+    // playhead, axis extent, and chart click-seeks all stay in local space:
+    // time.frame + the selected camera's maxFrame, with seeks translated
+    // through seekCameraFrame. All three are passthroughs when alignment
+    // isn't active. (Controls.vue's main scrubber correctly stays in global
+    // space; mixing that maxFrame here with a local playhead caused drift.)
+    const { frame: localFrame } = useTime();
+    const timelineMaxFrame = computed(() => {
+      try {
+        return aggregateController.value.getController(selectedCamera.value).maxFrame.value;
+      } catch {
+        // Selected camera's annotator hasn't mounted yet (e.g. mid load);
+        // fall back to the aggregate max rather than throwing.
+        return aggregateController.value.maxFrame.value;
+      }
+    });
+    function seekToFrame(frame: number) {
+      aggregateController.value.seekCameraFrame(selectedCamera.value, frame);
+    }
     return {
       currentView,
       toggleView,
-      collapsed,
-      maxFrame,
-      frame,
-      seek,
+      maxFrame: timelineMaxFrame,
+      multiCam,
+      frame: localFrame,
+      seek: seekToFrame,
       volume,
       setVolume,
       speed,
       setSpeed,
       ticks,
+      hasGroups,
+      attributeData,
+      registrationMarkers,
+      timelineEnabled,
+      activeCountSettings,
+      clientSettings,
+      countView,
+      help,
+      toggleCountView,
+      handleSelectTrack,
     };
   },
 });
 </script>
 
 <template>
-  <div>
-    <Controls>
+  <v-col
+    dense
+    :style="bottomLayout
+      ? 'position: relative; padding: 0px; margin: 0px; width: 100%; height: 100%; display: flex; flex-direction: column; min-height: 0;'
+      : 'position: absolute; bottom: 0px; padding: 0px; margin: 0px;'"
+  >
+    <Controls
+      :is-default-image="isDefaultImage"
+      :dataset-type="datasetType"
+      :bottom-layout="bottomLayout"
+      :wrap-bottom-controls="wrapBottomControls"
+    >
       <template slot="timelineControls">
-        <div style="min-width: 210px">
+        <div :style="{ 'min-width': bottomLayout && wrapBottomControls ? 'auto' : '270px', 'white-space': 'nowrap', width: bottomLayout && wrapBottomControls ? 'auto' : '100%' }">
           <v-tooltip
+            v-if="!bottomLayout || !wrapBottomControls"
             open-delay="200"
             bottom
           >
@@ -85,141 +249,260 @@ export default defineComponent({
               <v-icon
                 small
                 v-on="on"
-                @click="collapsed=!collapsed"
+                @click="$emit('update:collapsed', !collapsed)"
               >
-                {{ collapsed?'mdi-chevron-up-box': 'mdi-chevron-down-box' }}
+                {{ collapsed ? 'mdi-chevron-up-box' : 'mdi-chevron-down-box' }}
               </v-icon>
             </template>
             <span>Collapse/Expand Timeline</span>
           </v-tooltip>
-          <v-btn
-            class="ml-2"
-            :class="{'timeline-button':currentView!=='Detections' || collapsed}"
-            depressed
-            :outlined="currentView==='Detections' && !collapsed"
-            x-small
-            tab-index="-1"
-            @click="toggleView('Detections')"
+
+          <v-menu
+            v-model="activeCountSettings"
+            :nudge-top="28"
+            top
+            :close-on-content-click="false"
+            open-on-hover
+            open-delay="750"
+            close-delay="500"
           >
-            Detections
-          </v-btn>
+            <template #activator="{ on, attrs }">
+              <v-btn
+                class="ml-1"
+                :class="{ 'timeline-button': currentView !== 'Detections' || collapsed }"
+                depressed
+                :outlined="currentView === 'Detections' && !collapsed"
+                x-small
+                tab-index="-1"
+                v-bind="attrs"
+                v-on="on"
+                @click="toggleView('Detections')"
+              >
+                <span class="mr-1"># of</span>{{ countView }}
+              </v-btn>
+            </template>
+            <v-card
+              outlined
+              class="pa-2 pr-4"
+              color="blue-grey darken-3"
+              style="overflow-y: none"
+            >
+              <v-card-title>
+                Count Settings
+              </v-card-title>
+              <v-card-text>
+                <v-row>
+                  <v-col class="py-1">
+                    <v-btn small @click="toggleCountView()">
+                      Swap to {{ countView === 'detections' ? 'Tracks' : 'Detections' }}
+                    </v-btn>
+                  </v-col>
+                  <v-col
+                    cols="2"
+                    class="py-1"
+                    align="right"
+                  >
+                    <v-tooltip
+                      open-delay="200"
+                      bottom
+                    >
+                      <template #activator="{ on }">
+                        <v-icon
+                          small
+                          v-on="on"
+                        >
+                          mdi-help
+                        </v-icon>
+                      </template>
+                      <span>{{ help.countType }}</span>
+                    </v-tooltip>
+                  </v-col>
+                </v-row>
+                <v-row>
+                  <v-col class="py-1">
+                    <v-switch
+                      v-model="clientSettings.timelineCountSettings.totalCount"
+                      label="Show Total Count"
+                      class="my-0 ml-1 pt-0"
+                      dense
+                      hide-details
+                    />
+                  </v-col>
+                  <v-col
+                    cols="2"
+                    class="py-1"
+                    align="right"
+                  >
+                    <v-tooltip
+                      open-delay="200"
+                      bottom
+                    >
+                      <template #activator="{ on }">
+                        <v-icon
+                          small
+                          v-on="on"
+                        >
+                          mdi-help
+                        </v-icon>
+                      </template>
+                      <span>{{ help.showTotal }}</span>
+                    </v-tooltip>
+                  </v-col>
+                </v-row>
+              </v-card-text>
+            </v-card>
+          </v-menu>
           <v-btn
-            class="ml-2"
-            :class="{'timeline-button':currentView!=='Events' || collapsed}"
+            class="ml-1"
+            :class="{ 'timeline-button': currentView !== 'Events' || collapsed }"
             depressed
-            :outlined="currentView==='Events' && !collapsed"
+            :outlined="currentView === 'Events' && !collapsed"
             x-small
             tab-index="-1"
             @click="toggleView('Events')"
           >
             Events
           </v-btn>
+          <v-btn
+            v-if="!multiCam && hasGroups"
+            class="ml-1"
+            :class="{ 'timeline-button': currentView !== 'Groups' || collapsed }"
+            depressed
+            :outlined="currentView === 'Groups' && !collapsed"
+            x-small
+            tab-index="-1"
+            @click="toggleView('Groups')"
+          >
+            Groups
+          </v-btn>
+          <v-btn
+            v-if="!multiCam && timelineEnabled"
+            class="ml-1"
+            :class="{ 'timeline-button': currentView !== 'Attributes' || collapsed }"
+            depressed
+            :outlined="currentView === 'Attributes' && !collapsed"
+            x-small
+            tab-index="-1"
+            @click="toggleView('Attributes')"
+          >
+            Attributes
+          </v-btn>
         </div>
       </template>
       <template #middle>
-        <file-name-time-display
-          v-if="datasetType === 'image-sequence'"
-          class="text-middle px-3"
-          display-type="filename"
-        />
-        <span v-else-if="datasetType === 'video'">
-          <span class="mr-2">
-            <v-menu
-              :close-on-content-click="false"
-              top
-              offset-y
-              nudge-left="3"
-              open-on-hover
-              close-delay="500"
-              open-delay="250"
-              rounded="pill"
-            >
-              <template v-slot:activator="{ on }">
-                <v-icon
-                  @click="(!volume && setVolume(1)) || (volume && setVolume(0))"
-                  v-on="on"
-                > {{ volume === 0 ? 'mdi-volume-off' :'mdi-volume-medium' }}
-                </v-icon>
-              </template>
-              <v-card style="overflow:hidden; width:30px">
-                <v-slider
-                  :value="volume"
-                  min="0"
-                  max="1.0"
-                  step="0.05"
-                  vertical
-                  @change="setVolume"
-                />
-              </v-card>
-            </v-menu>
-          </span>
-          <span class="mr-2">
-            <v-menu
-              :close-on-content-click="false"
-              top
-              offset-y
-              nudge-left="3"
-              open-on-hover
-              close-delay="500"
-              open-delay="250"
-              rounded="lg"
-            >
-              <template v-slot:activator="{ on }">
-                <v-badge
-                  :value="speed != 1.0"
-                  color="#0277bd88"
-                  :content="`${speed}X`"
-                  offset-y="5px"
-                  overlap
-                >
-                  <v-icon
-                    v-on="on"
-                    @click="setSpeed(1)"
-                  > mdi-speedometer
-                  </v-icon>
-                </v-badge>
-              </template>
-              <v-card style="overflow:hidden; width:90px;">
-                <v-slider
-                  :value="ticks.indexOf(speed)"
-                  min="0"
-                  max="6"
-                  step="1"
-                  :tick-labels="ticks"
-                  ticks="always"
-                  :tick-size="4"
-                  style="font-size:0.75em;"
-                  vertical
-                  @change="setSpeed(ticks[$event])"
-                />
-
-              </v-card>
-            </v-menu>
-          </span>
+        <div :class="{ 'middle-content-bottom': bottomLayout }">
           <file-name-time-display
-            class="text-middle pl-2"
-            display-type="time"
+            v-if="datasetType === 'image-sequence' || datasetType === 'large-image' || datasetType === 'multi'"
+            :class="bottomLayout ? 'filename-toolbar' : 'text-middle px-3'"
+            display-type="filename"
+            :truncate-filename="bottomLayout"
           />
-        </span>
-        <v-tooltip
-          open-delay="200"
-          bottom
-        >
-          <template #activator="{ on }">
-            <v-icon
-              small
-              class="mx-2"
-              v-on="on"
-            >
-              mdi-information
-            </v-icon>
-          </template>
-          <span>
-            annotation framerate may be downsampled.
-            <br>
-            frame numbers start at zero.
+          <span v-else-if="datasetType === 'video'">
+            <span class="mr-2">
+              <v-menu
+                :close-on-content-click="false"
+                top
+                offset-y
+                nudge-left="3"
+                open-on-hover
+                close-delay="500"
+                open-delay="250"
+              >
+                <template #activator="{ on }">
+                  <v-icon
+                    @click="(!volume && setVolume(1)) || (volume && setVolume(0))"
+                    v-on="on"
+                  >
+                    {{ volume === 0 ? 'mdi-volume-off' : 'mdi-volume-medium' }}
+                  </v-icon>
+                </template>
+                <v-card style="overflow:hidden; width:60px;">
+                  <v-slider
+                    :value="volume"
+                    min="0"
+                    max="1.0"
+                    step="0.05"
+                    vertical
+                    @change="setVolume"
+                  />
+                  <v-row dense align="center">
+                    <b class="ma-auto">{{ volume * 100 }}%</b>
+                  </v-row>
+                </v-card>
+              </v-menu>
+            </span>
+            <span class="mr-2">
+              <v-menu
+                :close-on-content-click="false"
+                top
+                offset-y
+                nudge-left="3"
+                open-on-hover
+                close-delay="500"
+                open-delay="250"
+                rounded="lg"
+              >
+                <template #activator="{ on }">
+                  <v-badge
+                    :value="speed != 1.0"
+                    color="#0277bd88"
+                    :content="`${speed}X`"
+                    offset-y="5px"
+                    overlap
+                  >
+                    <v-icon
+                      v-on="on"
+                      @click="setSpeed(1)"
+                    >
+                      mdi-speedometer
+                    </v-icon>
+                  </v-badge>
+                </template>
+                <v-card style="overflow:hidden; width:60px;">
+                  <v-slider
+                    :value="ticks.indexOf(speed)"
+                    min="0"
+                    :max="ticks.length - 1"
+                    step="1"
+                    ticks="always"
+                    :tick-size="4"
+                    style="font-size:0.75em;"
+                    vertical
+                    hide-details
+                    @input="setSpeed(ticks[$event])"
+                  />
+                  <v-row dense align="center">
+                    <b class="ma-auto">{{ speed }}x</b>
+                  </v-row>
+                </v-card>
+              </v-menu>
+            </span>
+            <file-name-time-display
+              class="text-middle pl-2"
+              display-type="time"
+            />
           </span>
-        </v-tooltip>
+          <v-tooltip
+            v-if="!bottomLayout || !wrapBottomControls"
+            open-delay="200"
+            bottom
+          >
+            <template #activator="{ on }">
+              <v-icon
+                small
+                class="mx-2"
+                v-on="on"
+              >
+                mdi-information
+              </v-icon>
+            </template>
+            <span>
+              annotation framerate may be downsampled.
+              <br>
+              frame numbers start at zero.
+            </span>
+          </v-tooltip>
+        </div>
       </template>
     </Controls>
     <Timeline
@@ -227,6 +510,9 @@ export default defineComponent({
       :max-frame="maxFrame"
       :frame="frame"
       :display="!collapsed"
+      :dataset-type="datasetType"
+      :bottom-layout="bottomLayout"
+      :markers="registrationMarkers"
       @seek="seek"
     >
       <template
@@ -240,7 +526,7 @@ export default defineComponent({
         }"
       >
         <line-chart
-          v-if="currentView==='Detections'"
+          v-if="currentView === 'Detections'"
           :start-frame="startFrame"
           :end-frame="endFrame"
           :max-frame="childMaxFrame"
@@ -250,18 +536,39 @@ export default defineComponent({
           :margin="margin"
         />
         <event-chart
-          v-if="currentView==='Events'"
+          v-if="currentView === 'Events'"
           :start-frame="startFrame"
           :end-frame="endFrame"
           :max-frame="childMaxFrame"
           :data="eventChartData"
           :client-width="clientWidth"
           :margin="margin"
-          @select-track="$emit('select-track', $event)"
+          @select-track="handleSelectTrack"
+        />
+        <event-chart
+          v-if="currentView === 'Groups'"
+          :start-frame="startFrame"
+          :end-frame="endFrame"
+          :max-frame="childMaxFrame"
+          :data="groupChartData"
+          :client-width="clientWidth"
+          :margin="margin"
+          @select-track="$emit('select-group', $event)"
+        />
+        <line-chart
+          v-if="currentView === 'Attributes'"
+          :start-frame="startFrame"
+          :end-frame="endFrame"
+          :max-frame="endFrame"
+          :data="attributeData ? attributeData.data : []"
+          :client-width="clientWidth"
+          :client-height="clientHeight"
+          :margin="margin"
+          :atrributes-chart="true"
         />
       </template>
     </Timeline>
-  </div>
+  </v-col>
 </template>
 
 <style lang="scss" scoped>
@@ -275,5 +582,18 @@ export default defineComponent({
 }
 .timeline-button {
   border: thin solid transparent;
+}
+.middle-content-bottom {
+  display: flex;
+  align-items: baseline;
+  white-space: nowrap;
+  overflow-x: hidden;
+  overflow-y: visible;
+  min-width: 0;
+}
+.middle-content-bottom .filename-toolbar {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
 }
 </style>

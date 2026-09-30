@@ -37,6 +37,11 @@ export default Vue.extend({
         return !data.find((datum) => !Array.isArray(datum.values));
       },
     },
+    // Adds Linear charts, changes scale, highlighting of lines
+    atrributesChart: {
+      type: Boolean,
+      default: false,
+    },
   },
   computed: {
     /**
@@ -75,6 +80,7 @@ export default Vue.extend({
         .select('svg')
         .remove();
       let tooltipTimeoutHandle = null;
+      d3.select('.tooltip').remove();
       const tooltip = d3
         .select(this.$el)
         .append('div')
@@ -84,20 +90,33 @@ export default Vue.extend({
       const height = this.clientHeight;
       const x = d3
         .scaleLinear()
-        .domain([this.startFrame, this.endFrame])
+        .domain([this.startFrame, this.endFrame || 1])
         .range([this.margin, width]);
       this.x = x;
       const max = d3.max(this.data, (datum) => d3.max(datum.values, (d) => d[1]));
-      const y = d3
+      let y = d3
         .scaleLinear()
         .domain([0, Math.max(max + max * 0.2, 2)])
         .range([height, 0]);
+      if (this.atrributesChart) {
+        y = d3
+          .scaleLinear()
+          .domain([0, Math.max(max * 1.2, 1.0)])
+          .range([height, 0]);
+      }
 
-      const line = d3
+      let line = d3
         .line()
         .curve(d3.curveStepAfter)
         .x((d) => x(d[0]))
         .y((d) => y(d[1]));
+      if (this.atrributesChart) {
+        line = d3
+          .line()
+          .curve(d3.curveLinear)
+          .x((d) => x(d[0]))
+          .y((d) => y(d[1]));
+      }
       this.line = line;
 
       const svg = d3
@@ -119,6 +138,8 @@ export default Vue.extend({
           .attr('x', -5)
           .attr('dx', 13));
 
+      let highlightedLine = null;
+      let highlightedColor = null;
       const path = svg
         .selectAll()
         .data(this.data)
@@ -127,25 +148,33 @@ export default Vue.extend({
         .attr('class', 'line')
         .attr('d', (d) => line(d.values))
         .style('stroke', (d) => (d.color ? d.color : '#4c9ac2'))
-        // Non-Arrow function to preserve the 'this' context for d3.mouse(this)
-        .on('mouseenter', function mouseEnterHandler(d) {
-          const [_x, _y] = d3.mouse(this);
+        // Non-Arrow function to preserve the 'this' context for d3.pointer(event, this)
+        .on('mouseenter', function mouseEnterHandler(event, d) {
+          const [_x, _y] = d3.pointer(event, this);
           tooltipTimeoutHandle = setTimeout(() => {
             tooltip
               .style('left', `${_x + 2}px`)
               .style('top', `${_y - 25}px`)
               .text(d.name)
               .style('display', 'block');
-          }, 200);
+            d3.select(this).style('stroke', 'cyan').style('stroke-width', 3);
+            highlightedColor = d.color;
+            // eslint-disable-next-line @typescript-eslint/no-this-alias
+            highlightedLine = this;
+          }, 50);
         })
-        .on('mouseout', () => {
+        // eslint-disable-next-line prefer-arrow-callback
+        .on('mouseout', function mouseExitHandler() {
           clearTimeout(tooltipTimeoutHandle);
           tooltip.style('display', 'none');
+          if (highlightedLine !== null) {
+            d3.select(highlightedLine).style('stroke', highlightedColor).style('stroke-width', 1);
+          }
         });
       this.path = path;
     },
     update() {
-      this.x.domain([this.startFrame, this.endFrame]);
+      this.x.domain([this.startFrame, this.endFrame || 1]);
       this.line.x((d) => this.x(d[0]));
       this.path.attr('d', (d) => this.line(d.values));
     },
@@ -168,6 +197,7 @@ export default Vue.extend({
 
   .axis-y {
     font-size: 12px;
+    user-select: none;
 
     g:first-of-type,
     g:last-of-type {

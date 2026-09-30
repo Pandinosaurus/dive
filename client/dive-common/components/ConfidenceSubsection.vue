@@ -1,10 +1,10 @@
 <script lang="ts">
 import {
   defineComponent, PropType,
-} from '@vue/composition-api';
+} from 'vue';
 
 import {
-  useTypeStyling,
+  useTrackStyleManager,
 } from 'vue-media-annotator/provides';
 
 import PanelSubsection from 'dive-common/components/PanelSubsection.vue';
@@ -19,9 +19,17 @@ export default defineComponent({
       type: Array as PropType<[string, number][]>,
       required: true,
     },
+    disabled: {
+      type: Boolean,
+      default: false,
+    },
+    userModified: {
+      type: Boolean,
+      default: false,
+    },
   },
   setup() {
-    const typeStylingRef = useTypeStyling();
+    const typeStylingRef = useTrackStyleManager().typeStyling;
     // TODO:  Adding, Deleting, Editing Confidence Levels in this interface
     return {
       typeStylingRef,
@@ -82,11 +90,56 @@ export default defineComponent({
                 }"
               />
             </v-col>
-            <v-col class="type-item-value">
+            <v-col :cols="pair[1] !== 1 && !disabled ? '6' : '7'">
               {{ pair[0] }}
             </v-col>
-            <v-col class="type-score">
+            <v-spacer />
+            <v-col
+              cols="2"
+              class="type-score shrink mr-1"
+            >
               {{ pair[1].toFixed(4) }}
+            </v-col>
+            <v-col v-if="userModified && index === 0" cols="1">
+              <v-tooltip
+                open-delay="200"
+                bottom
+              >
+                <template #activator="{ on }">
+                  <v-icon
+                    small
+                    color="orange"
+                    class="ml-1"
+                    v-on="on"
+                  >
+                    mdi-pencil
+                  </v-icon>
+                </template>
+                <span>This annotation has been modified by a user</span>
+              </v-tooltip>
+            </v-col>
+            <v-col
+              v-if="pair[1] !== 1 && !disabled"
+              class="shrink"
+              cols="1"
+            >
+              <v-tooltip
+                open-delay="200"
+                bottom
+              >
+                <template #activator="{ bind, on }">
+                  <v-btn
+                    x-small
+                    icon
+                    v-bind="bind"
+                    v-on="on"
+                    @click="$emit('set-type', pair[0])"
+                  >
+                    <v-icon>mdi-check</v-icon>
+                  </v-btn>
+                </template>
+                <span>Accept {{ pair[0] }} as correct type</span>
+              </v-tooltip>
             </v-col>
           </v-row>
         </span>
@@ -97,19 +150,9 @@ export default defineComponent({
 
 <style lang="scss">
 .type-color-box {
-  margin-top: 5px;
   min-width: 10px;
   max-width: 10px;
   min-height: 10px;
   max-height: 10px;
-}
-.type-item-value {
-  max-width: 80%;
-  margin: 0px;
-}
-.type-score {
-  font-size: 1em;
-  max-width: 25%;
-  min-width: 25%;
 }
 </style>

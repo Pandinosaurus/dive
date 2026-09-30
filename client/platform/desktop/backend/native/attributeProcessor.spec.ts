@@ -1,14 +1,10 @@
-/* eslint-disable quote-props */
-/* eslint-disable @typescript-eslint/camelcase */
-
 import { MultiTrackRecord } from 'dive-common/apispec';
 import { TrackData } from 'vue-media-annotator/track';
-import type { Attribute } from 'vue-media-annotator/use/useAttributes';
+import type { Attribute } from 'vue-media-annotator/use/AttributeTypes';
 import fs from 'fs-extra';
 import processTrackAttributes from './attributeProcessor';
 
 type AttributeTestGroup = [TrackData[], MultiTrackRecord, Record<string, Attribute>][];
-
 
 const testData: AttributeTestGroup = fs.readJSONSync('../testutils/attributes.spec.json');
 

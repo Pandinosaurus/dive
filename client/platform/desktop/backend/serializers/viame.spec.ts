@@ -1,10 +1,12 @@
-/// <reference types="jest" />
-import { MultiTrackRecord } from 'dive-common/apispec';
+import { AnnotationSchema, MultiTrackRecord } from 'dive-common/apispec';
+// eslint-disable-next-line import/no-unresolved -- csv-parse/sync is a valid package export
+import { parse as parseSync } from 'csv-parse/sync';
 import fs from 'fs-extra';
 import mockfs from 'mock-fs';
-import { JsonMeta } from 'platform/desktop/constants';
+import { Readable, Writable } from 'stream';
+import { AnnotationsCurrentVersion, JsonConfig } from 'platform/desktop/constants';
 import { serialize, parse, parseFile } from 'platform/desktop/backend/serializers/viame';
-import { Attribute } from 'vue-media-annotator/use/useAttributes';
+import { Attribute } from 'vue-media-annotator/use/AttributeTypes';
 import processTrackAttributes from 'platform/desktop/backend/native/attributeProcessor';
 import { Console } from 'console';
 
@@ -15,7 +17,7 @@ const testData: testPairs[] = fs.readJSONSync('../testutils/viame.spec.json');
 const imageFilenameTests = [
   {
     pass: false,
-    error: 'There was a mixture of fields that specified image names and fields that did not.  Please check the CSV',
+    error: 'A subsampling of images were used with the CSV but they were not sequential',
     csv: [
       '0,       ,1,884.66,510,1219.66,737.66,1,-1,ignored,0.98',
       '1,2.png,0,111,222,3333,444,1,-1,typestring,0.55',
@@ -23,10 +25,18 @@ const imageFilenameTests = [
   },
   {
     pass: false,
-    error: 'There was a mixture of fields that specified image names and fields that did not.  Please check the CSV',
+    error: 'A subsampling of images were used with the CSV but they were not sequential',
     csv: [
       '0,1.png,1,884.66,510,1219.66,737.66,1,-1,ignored,0.98',
-      '1,,0,111,222,3333,444,1,-1,typestring,0.55',
+      '1,invalid,0,111,222,3333,444,1,-1,typestring,0.55',
+    ],
+  },
+  {
+    pass: true,
+    csv: [
+      '0,invalid1,1,884.66,510,1219.66,737.66,1,-1,ignored,0.98',
+      '',
+      '1,invalid2,0,111,222,3333,444,1,-1,typestring,0.55',
     ],
   },
   {
@@ -37,14 +47,36 @@ const imageFilenameTests = [
       '1,,0,111,222,3333,444,1,-1,typestring,0.55',
     ],
   },
+  {
+    pass: true,
+    csv: [
+      '0,1.png,1,884.66,510,1219.66,737.66,1,-1,ignored,0.98',
+      '',
+      '1,1.png,0,111,222,3333,444,1,-1,typestring,0.55',
+    ],
+  },
+  {
+    pass: false,
+    error: 'Error: Images were provided in an unexpected order and dataset contains multi-frame tracks.',
+    csv: [
+      '99,1.png,0,884.66,510,1219.66,737.66,1,-1,ignored,0.98',
+      '99,3.png,1,111,222,3333,444,1,-1,typestring,0.55',
+    ],
+  },
+  {
+    pass: true,
+    csv: [
+      '99,unknown1,2,884.66,510,1219.66,737.66,1,-1,ignored,0.98',
+      '99,unknown2,2,111,222,3333,444,1,-1,typestring,0.55',
+    ],
+  },
 ];
 
-
-const data: MultiTrackRecord = {
+const trackMap: MultiTrackRecord = {
   1: {
     begin: 0,
     end: 5,
-    trackId: 1,
+    id: 1,
     features: [
       {
         frame: 0,
@@ -120,6 +152,11 @@ const data: MultiTrackRecord = {
   },
 };
 
+const data: AnnotationSchema = {
+  tracks: trackMap,
+  groups: {},
+  version: AnnotationsCurrentVersion,
+};
 
 const meta = {
   version: 1,
@@ -142,15 +179,13 @@ const meta = {
   },
   multiCam: null,
   subType: null,
-} as JsonMeta;
+} as JsonConfig;
 const testFiles: Record<string, string> = { };
 testData.forEach((item, index) => {
-  // eslint-disable-next-line prefer-destructuring
   testFiles[`${index}.csv`] = item[0].join('\n');
 });
 const imageOrderFiles: Record<string, string> = { };
 imageFilenameTests.forEach((item, index) => {
-  // eslint-disable-next-line prefer-destructuring
   imageOrderFiles[`${index}.csv`] = item.csv.join('\n');
 });
 
@@ -158,16 +193,17 @@ imageFilenameTests.forEach((item, index) => {
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const console = new Console(process.stdout, process.stderr);
 
-mockfs({
-  '/home': {},
-  'home/user/media/projectid1data': {
-    'foo.png': '',
-    'bar.png': '',
-  },
-  '/imageorder': imageOrderFiles,
-  '/csv': testFiles,
+beforeEach(() => {
+  mockfs({
+    '/home': {},
+    'home/user/media/projectid1data': {
+      'foo.png': '',
+      'bar.png': '',
+    },
+    '/imageorder': imageOrderFiles,
+    '/csv': testFiles,
+  });
 });
-
 
 // Returns first confidence pairs output of CSV that isn't a comment
 function checkConfidenceOutput(output: string[]) {
@@ -203,14 +239,64 @@ describe('VIAME Python Compatibility Check', () => {
       const trackArray = Object.values(trackData);
       // eslint-disable-next-line no-await-in-loop
       const results = await parse(csvStream);
-      expect(results.tracks).toEqual(trackArray);
-      // eslint-disable-next-line no-await-in-loop
-      const attData = processTrackAttributes(results.tracks);
+      expect(Object.values(results[0].tracks)).toEqual(trackArray);
+      const attData = processTrackAttributes(Object.values(results[0].tracks));
       expect(testAttributes).toEqual(attData.attributes);
     }
   });
 });
 
+describe('Detection length import', () => {
+  [0, -1, -2.5, 12.5].forEach((columnLength) => {
+    [undefined, 0, -1, -2.5, 7.5].forEach((attributeLength) => {
+      it(`imports positive lengths from column ${columnLength} and attribute ${attributeLength}`, async () => {
+        let csv = `0,1.png,0,10,10,20,20,1,${columnLength},fish,0.9,(atr) other 3`;
+        if (attributeLength !== undefined) {
+          csv += `,(atr) length ${attributeLength}`;
+        }
+        const [data] = await parse(Readable.from([csv]));
+        const track = Object.values(data.tracks)[0];
+        const feature = track.features[0];
+        const expected = attributeLength !== undefined && attributeLength > 0
+          ? attributeLength : columnLength;
+        expect(feature.attributes?.other).toBe(3);
+        const { attributes } = processTrackAttributes([track]);
+        if (expected > 0) {
+          expect(feature.attributes?.length).toBe(expected);
+          expect(feature.fishLength).toBe(expected);
+          expect(attributes).toHaveProperty('detection_length');
+        } else {
+          expect(feature.attributes).not.toHaveProperty('length');
+          expect(feature).not.toHaveProperty('fishLength');
+          expect(attributes).not.toHaveProperty('detection_length');
+        }
+      });
+    });
+  });
+});
+
+describe('Attribute value parsing', () => {
+  it('keeps filename-like attribute values as full strings', async () => {
+    const csv = [
+      '0,1.png,0,10,10,20,20,1,-1,seal,0.9,'
+      + '(atr) source_image 0123ABC456,'
+      + '(atr) other_file 20240624_120000_C0_0042.jpg,'
+      + '(atr) score 12.5,(atr) flag true',
+    ].join('\n');
+    const results = await parse(Readable.from([csv]));
+    const track = Object.values(results[0].tracks)[0];
+    const attrs = track.features[0].attributes || {};
+    expect(attrs.source_image).toBe('0123ABC456');
+    expect(attrs.other_file).toBe('20240624_120000_C0_0042.jpg');
+    expect(attrs.score).toBe(12.5);
+    expect(attrs.flag).toBe(true);
+    const attData = processTrackAttributes(Object.values(results[0].tracks));
+    expect(attData.attributes.detection_source_image.datatype).toBe('text');
+    expect(attData.attributes.detection_other_file.datatype).toBe('text');
+    expect(attData.attributes.detection_score.datatype).toBe('number');
+    expect(attData.attributes.detection_flag.datatype).toBe('boolean');
+  });
+});
 
 describe('VIAME serialize testing', () => {
   it('testing exporting with viame CSV and proper order', async () => {
@@ -256,6 +342,103 @@ describe('VIAME serialize testing', () => {
     const expectedOutput = ['first_type', '0.9', 'second_type', '0.7'];
     expect(checkConfidenceOutput(output)).toEqual(expectedOutput);
   });
+  it('keeps an explicit zero score when its type threshold is zero', async () => {
+    const path = '/home/zero-threshold.csv';
+    const stream = fs.createWriteStream(path);
+    const zeroData = JSON.parse(JSON.stringify(data)) as AnnotationSchema;
+    const [zeroTrack] = Object.values(zeroData.tracks);
+    zeroTrack.confidencePairs.push(['zero_type', 0]);
+    await serialize(stream, zeroData, {
+      ...meta,
+      confidenceFilters: { default: 0.65, zero_type: 0 },
+    } as JsonConfig, new Set<string>(), {
+      excludeBelowThreshold: true,
+      header: true,
+    });
+    const output = fs.readFileSync(path).toString().split('\n');
+    expect(checkConfidenceOutput(output)).toContain('zero_type');
+    expect(checkConfidenceOutput(output)).toContain('0');
+  });
+});
+
+// Returns the entries of the `# metadata` row (without the leading marker), or null if absent
+function getMetadataFields(output: string[]): string[] | null {
+  const metadataLine = output.find((line) => line.startsWith('# metadata'));
+  if (metadataLine === undefined) {
+    return null;
+  }
+  return (parseSync(metadataLine) as string[][])[0].slice(1);
+}
+
+function getDatasetInfoEntry(output: string[]): Record<string, unknown> | null {
+  const fields = getMetadataFields(output);
+  if (fields === null) {
+    return null;
+  }
+  const entry = fields.find((field) => field.startsWith('dataset_info: '));
+  return entry ? JSON.parse(entry.slice('dataset_info: '.length)) : null;
+}
+
+describe('VIAME datasetInfo passthrough', () => {
+  const datasetInfo = {
+    gfishsite_id: '2024TXN012',
+    cruise: 2403,
+    sta_lat: 26.8195,
+    year: 2024,
+  };
+
+  it('writes a populated datasetInfo as one nested JSON entry on the # metadata line', async () => {
+    const path = '/home/test.json';
+    const stream = fs.createWriteStream(path);
+    await serialize(stream, data, { ...meta, datasetInfo } as JsonConfig, new Set<string>(), {
+      excludeBelowThreshold: false,
+      header: true,
+    });
+    const output = fs.readFileSync(path).toString().split('\n');
+    const parsed = getDatasetInfoEntry(output);
+    // round-trips as a single key with numeric fields preserved and ids kept as strings
+    expect(parsed).toEqual(datasetInfo);
+    expect(typeof parsed?.cruise).toBe('number');
+    expect(typeof parsed?.sta_lat).toBe('number');
+    expect(typeof parsed?.gfishsite_id).toBe('string');
+  });
+
+  it('omits the datasetInfo entry entirely when datasetInfo is empty', async () => {
+    const path = '/home/test.json';
+    const stream = fs.createWriteStream(path);
+    await serialize(stream, data, { ...meta, datasetInfo: {} } as JsonConfig, new Set<string>(), {
+      excludeBelowThreshold: false,
+      header: true,
+    });
+    const output = fs.readFileSync(path).toString().split('\n');
+    const fields = getMetadataFields(output);
+    expect(fields).not.toBeNull();
+    expect(fields?.some((field) => field.startsWith('dataset_info'))).toBe(false);
+  });
+
+  it('restores datasetInfo from the # metadata line on parse', async () => {
+    const path = '/home/test.json';
+    const stream = fs.createWriteStream(path);
+    await serialize(stream, data, { ...meta, datasetInfo } as JsonConfig, new Set<string>(), {
+      excludeBelowThreshold: false,
+      header: true,
+    });
+    const [parsedData] = await parseFile(path);
+    expect(parsedData.datasetInfo).toEqual(datasetInfo);
+  });
+
+  // Drive an unusable dataset_info field straight into parse via a # metadata row.
+  // Each case should be skipped with a warning rather than aborting the import.
+  it.each([
+    ['malformed JSON', 'dataset_info: {bad json}', /malformed dataset_info/],
+    ['a JSON number', 'dataset_info: 42', /expected a JSON object but got number/],
+    ['a JSON array', 'dataset_info: [1]', /expected a JSON object but got array/],
+    ['JSON null', 'dataset_info: null', /expected a JSON object but got null/],
+  ])('skips %s with a warning and no datasetInfo', async (_label, field, pattern) => {
+    const [parsedData, warnings] = await parse(Readable.from(`# metadata,fps: 30,${field}`));
+    expect(parsedData.datasetInfo).toBeUndefined();
+    expect(warnings.some((w) => pattern.test(w))).toBe(true);
+  });
 });
 
 describe('Test Image Filenames', () => {
@@ -273,18 +456,61 @@ describe('Test Image Filenames', () => {
         // eslint-disable-next-line no-await-in-loop
           await parseFile(testPath, imageMap);
         } catch (err) {
-          expect(err).toBe(imageOrderData.error);
+          expect((err as Error).toString()).toBe(imageOrderData.error);
         }
       } else {
         // eslint-disable-next-line no-await-in-loop
         const result = await parseFile(testPath, imageMap);
-        expect(result.tracks.length).toBeGreaterThan(0);
+        expect(Object.values(result[0].tracks).length).toBeGreaterThan(0);
       }
     }
   });
 });
 
-
-afterAll(() => {
+afterEach(() => {
   mockfs.restore();
+});
+
+it('imports ordered subpixel centerlines and unrelated keypoints', async () => {
+  const csv = '1,img.png,0,0,0,100,100,1,-1,fish,1,(kp) tail 90 10,(kp) spine_010 60.123456789 40,(kp) head 10 10,(kp) spine_002 40 30,(kp) eye 12 11';
+  const [data] = await parse(Readable.from([csv]));
+  const feature = Object.values(data.tracks)[0].features[0];
+  const line = feature.geometry!.features.find((g) => g.geometry.type === 'LineString');
+  expect(line?.geometry.coordinates).toEqual([[10, 10], [40, 30], [60.123456789, 40], [90, 10]]);
+  expect(feature.geometry!.features.some((g) => g.properties?.key === 'eye')).toBe(true);
+});
+
+it('round-trips line-only JSON through CSV without rounding vertices', async () => {
+  const coordinates = [[10.123456789, 20], [20, 30.987654321], [30, 20]];
+  const annotation = {
+    ...data,
+    tracks: {
+      1: {
+        ...Object.values(data.tracks)[0],
+        id: 1,
+        begin: 0,
+        end: 0,
+        features: [{
+          frame: 0,
+          keyframe: true,
+          bounds: [0, 0, 100, 100],
+          geometry: {
+            type: 'FeatureCollection',
+            features: [{
+              type: 'Feature',
+              properties: { key: 'HeadTails' },
+              geometry: { type: 'LineString', coordinates },
+            }],
+          },
+        }],
+      },
+    },
+  } as AnnotationSchema;
+  let output = '';
+  const stream = new Writable({ write(chunk, encoding, callback) { output += chunk.toString(); callback(); } });
+  await serialize(stream, annotation, meta, new Set(), { excludeBelowThreshold: false, header: false });
+  const [loaded] = await parse(Readable.from([output]));
+  const geometry = Object.values(loaded.tracks)[0].features[0].geometry!;
+  expect(geometry.features.find((f) => f.geometry.type === 'LineString')?.geometry.coordinates).toEqual(coordinates);
+  expect(output).toContain('(kp) spine_001 20 30.987654321');
 });

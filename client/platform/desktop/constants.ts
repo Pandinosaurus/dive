@@ -1,12 +1,26 @@
 import type {
-  DatasetMeta, DatasetMetaMutable, DatasetType,
-  Pipe, SubType, MediaImportResponse,
+  DatasetConfig, DatasetConfigMutable, DatasetType,
+  Pipe, SubType, MediaImportResponse, PipelineParams,
+  VideoSearchIndexMeta, VideoSearchIndexMethod,
 } from 'dive-common/apispec';
-import { Attribute } from 'vue-media-annotator/use/useAttributes';
+import { Attribute } from 'vue-media-annotator/use/AttributeTypes';
+import { AttributeTrackFilter } from 'vue-media-annotator/AttributeTrackFilterControls';
+import { ImageEnhancements } from 'vue-media-annotator/use/useImageEnhancements';
+import type { ScoringJobArgs } from 'dive-common/scoring/types';
 
-
-export const JsonMetaCurrentVersion = 1;
+export const JsonConfigCurrentVersion = 1;
 export const SettingsCurrentVersion = 1;
+export const AnnotationsCurrentVersion = 2;
+export const ProjectsFolderName = 'DIVE_Projects';
+export const JobsFolderName = 'DIVE_Jobs';
+export const JobsOutputFolderName = 'DIVE_Jobs_Output';
+export const PipelinesFolderName = 'DIVE_Pipelines';
+// Basename (without extension) of the saved "most recently used" calibration.
+// The stored file keeps the source file's real extension (e.g. last_calibration.npz).
+export const LastCalibrationBaseName = 'last_calibration';
+// Cross-dataset "shared" color/style overrides, stored once per data directory
+// and reused across every sequence when the shared color scope is enabled.
+export const GlobalStyleSettingsFileName = 'global_style_settings.json';
 
 export interface Settings {
   // version a schema version
@@ -35,23 +49,37 @@ export interface Camera {
   originalVideoFile: string;
   transcodedImageFiles: string[];
   transcodedVideoFile: string;
+  transcodedMisalign?: boolean;
   imageListPath?: string;
+  /** Stored camera-local metadata attachment path. */
+  metadataFile?: string;
+  /** Preserved original name of the camera-local metadata attachment. */
+  metadataOriginalName?: string;
 }
 
 export interface MultiCamDesktop {
   cameras: Record<string, Camera>;
+  // Camera names in display order, chosen at import. Display and pipeline
+  // camera ordering both read this; the EO-first/IR-last name heuristic is
+  // only a fallback for datasets imported before the order was persisted.
+  cameraOrder?: string[];
   //Calibration file in .npz format used for stereo or other cameras
   calibration?: string;
+  // Name of the user's original calibration file (preserved for display, since
+  // `calibration` may point at a converted/normalized copy).
+  calibrationOriginalName?: string;
+  // Absolute path of the calibration file at import (before project copy/conversion).
+  calibrationSourcePath?: string;
   // Default Display Key for showing multiCam
   defaultDisplay: string;
 }
 
 /**
- * JsonMeta is a SUBSET of DatasetMeta contained within
- * the JsonFileSchema.  The remaining parts of DatasetMeta must
+ * JsonConfig is a SUBSET of DatasetConfig contained within
+ * the JsonFileSchema.  The remaining parts of DatasetConfig must
  * be generated at load time.
  */
-export interface JsonMeta extends DatasetMetaMutable {
+export interface JsonConfig extends DatasetConfigMutable {
   // version used to manage schema migrations
   version: number;
 
@@ -81,9 +109,14 @@ export interface JsonMeta extends DatasetMetaMutable {
   // relative to originalBasePath
   originalVideoFile: string;
 
+  // large image (e.g. GeoTIFF) file path, relative to originalBasePath
+  originalLargeImageFile?: string;
+
   // output of web safe transcoding
   // relative to project path
   transcodedVideoFile: string;
+
+  transcodedMisalign?: boolean;
 
   // ordered image filenames IF this is an image dataset
   // If paths are relative, they're relative to originalBasePath
@@ -101,20 +134,38 @@ export interface JsonMeta extends DatasetMetaMutable {
   // key that ran transcoding
   transcodingJobKey?: string;
 
-  // attributes are not datasetMetaMutable and are stored separate
+  error?: string;
+
+  // attributes are not DatasetConfigMutable and are stored separate
   attributes?: Record<string, Attribute>;
+
+  // attributes are not DatasetConfigMutable and are stored separate
+  attributeTrackFilters?: Record<string, AttributeTrackFilter>;
 
   // confidence filter threshold for exporting
   confidenceFilters?: Record<string, number>;
+
+  // image enhancement settings
+  imageEnhancement?: ImageEnhancements;
 
   // Stereo or multi-camera datasets with uniform type (all images, all video)
   multiCam: MultiCamDesktop | null;
 
   // Stereo or multi-camera datasets with uniform type (all images, all video)
   subType: SubType;
+
+  // Optional per-dataset metadata file (e.g. sea-lion flight log), copied into
+  // the project directory at import. Absolute path to the stored copy; handed to
+  // opt-in pipelines at run time (see the pipe `# Metadata File:` header).
+  metadataFile?: string;
+  // The user's original metadata file name, preserved for display.
+  metadataOriginalName?: string;
+
+  // execTime is athe execution time for desktop runs
+  execTime?: number
 }
 
-export type DesktopMetadata = DatasetMeta & JsonMeta;
+export type DesktopConfig = DatasetConfig & JsonConfig;
 
 interface NvidiaSmiTextRecord {
   _text: string;
@@ -135,14 +186,37 @@ export interface NvidiaSmiReply {
   error: string;
 }
 
+export enum JobType {
+  Conversion,
+  ExportTrainedPipeline,
+  RunPipeline,
+  RunTraining,
+  RunScoring,
+  BuildSearchIndex,
+}
+
+export interface JobArgs {
+  type: JobType;
+}
+
 /** TODO promote to apispec */
-export interface RunPipeline {
+export interface RunPipeline extends JobArgs {
+  type: JobType.RunPipeline;
   datasetId: string;
+  pipeline: Pipe;
+  pipelineParams?: PipelineParams;
+  outputDatasetName?: string;
+}
+
+export interface ExportTrainedPipeline extends JobArgs {
+  type: JobType.ExportTrainedPipeline;
+  path: string;
   pipeline: Pipe;
 }
 
 /** TODO promote to apispec */
-export interface RunTraining {
+export interface RunTraining extends JobArgs {
+  type: JobType.RunTraining;
   // datasets to run training on
   datasetIds: string[];
   // new pipeline name to be created
@@ -153,12 +227,50 @@ export interface RunTraining {
   annotatedFramesOnly: boolean;
   // contents of labels.txt file
   labelText?: string;
+  // fine tuning model
+  fineTuneModel?: {
+    name: string;
+    type: string;
+    path?: string;
+    folderId?: string;
+  };
+  // working directory of a prior interrupted run to continue from
+  resumeWorkingDir?: string;
 }
 
-export interface ConversionArgs {
-  meta: JsonMeta;
-  mediaList: [string, string][];
+export interface RunScoring extends JobArgs, ScoringJobArgs {
+  type: JobType.RunScoring;
 }
+
+export interface ConversionArgs extends JobArgs {
+  type: JobType.Conversion;
+  meta: JsonConfig;
+  mediaList: [string, string][];
+  importWarnings?: string[];
+}
+
+/** IPC payload when a CLI open must wait on media conversion. */
+export interface CliTranscodingNotice {
+  datasetId: string;
+  name: string;
+  mediaCount: number;
+}
+
+/** Build a video search / IQR descriptor index over a dataset. */
+export interface BuildSearchIndex extends JobArgs {
+  type: JobType.BuildSearchIndex;
+  datasetId: string;
+  // detections: index around generic object proposals
+  // tracking: index around tracked proposals
+  // existing: index around this dataset's existing annotations
+  method: VideoSearchIndexMethod;
+}
+
+/** Sidecar metadata written alongside a built search index. */
+export type SearchIndexMeta = VideoSearchIndexMeta;
+
+export type Job = ConversionArgs | RunPipeline | RunTraining
+  | ExportTrainedPipeline | RunScoring | BuildSearchIndex;
 
 export interface DesktopJob {
   // key unique identifier for this job
@@ -166,11 +278,12 @@ export interface DesktopJob {
   // command that was run
   command: string;
   // jobType identify type of job
-  jobType: 'pipeline' | 'training' | 'conversion';
+  jobType: 'pipeline' | 'training' | 'conversion' | 'export' | 'scoring' | 'indexing';
   // title whatever humans should see this job called
   title: string;
   // arguments to creation
-  args: RunPipeline | RunTraining | ConversionArgs;
+  args: RunPipeline | RunTraining | ExportTrainedPipeline | ConversionArgs | RunScoring
+    | BuildSearchIndex;
   // datasetIds of the involved datasets
   datasetIds: string[];
   // pid of the process spawned
@@ -183,15 +296,34 @@ export interface DesktopJob {
   startTime: Date;
   // endTime time of process exit
   endTime?: Date;
+  // cancelledJob
+  cancelledJob?: boolean;
 }
 
 export interface DesktopMediaImportResponse extends MediaImportResponse {
-  jsonMeta: JsonMeta;
+  jsonConfig: JsonConfig;
   trackFileAbsPath: string;
   multiCamTrackFiles: null | Record<string, string>;
   forceMediaTranscode: boolean;
-  metaFileAbsPath?: string;
+  /** Absolute path of an optional DIVE Configuration File (JSON) chosen at import. */
+  configFileAbsPath?: string;
+  /** Absolute path of an optional KWCOCO species list chosen at import. */
+  speciesFileAbsPath?: string;
+  /** Absolute path of an optional Metadata File (pipeline sidecar) chosen at import. */
+  // Absolute path of the one optional metadata attachment. Seeded by import-time discovery
+  // (an exported folder's metadata/ directory, or a reserved-name file beside the media) and
+  // shown in the import dialog, where the user can clear or replace it before finalize.
+  metadataFileAbsPath?: string;
+  // Non-fatal problems found while preparing the import (e.g. a registration
+  // file naming cameras this dataset doesn't have), shown in the import dialog.
+  importWarnings?: string[];
 }
+
+export type {
+  MultiCamBatchCamera,
+  MultiCamBatchCollect,
+  MultiCamBatchScanResult,
+} from 'dive-common/multiCamBatchScan';
 
 export interface DesktopJobUpdate extends DesktopJob {
   // body contents of update payload
@@ -200,18 +332,6 @@ export interface DesktopJobUpdate extends DesktopJob {
 
 export type DesktopJobUpdater = (msg: DesktopJobUpdate) => void;
 
-export interface FFProbeResults {
-  streams?: [{
-    avg_frame_rate?: string;
-    r_frame_rate?: string;
-    codec_type?: string;
-    codec_name?: string;
-    sample_aspect_ratio?: string;
-    width?: number;
-    height?: number;
-  }];
-}
-
 interface FFProbeFrame {
   best_effort_timestamp_time: number;
 }
@@ -219,16 +339,12 @@ export interface FFProbeFrameResults{
   frames: FFProbeFrame[];
 }
 
-export type ConvertMedia =
-(settings: Settings,
-  args: ConversionArgs,
-  updater: DesktopJobUpdater) => Promise<DesktopJob>;
-
 export interface ExportDatasetArgs {
     id: string;
     exclude: boolean;
     path: string;
     typeFilter: Set<string>;
+    type?: 'csv' | 'json' | 'coco';
   }
 
 export interface ExportConfigurationArgs {
@@ -236,9 +352,9 @@ export interface ExportConfigurationArgs {
    path: string;
 }
 
-export interface CheckMediaResults {
-  websafe: boolean;
-  originalFpsString: string;
-  originalFps: number;
-  videoDimensions: {width: number; height: number};
+export interface ExportMulticamEverythingArgs {
+  id: string;
+  exclude: boolean;
+  path: string;
+  typeFilter: Set<string>;
 }

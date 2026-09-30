@@ -1,30 +1,31 @@
 <script lang="ts">
 import {
   defineComponent, ref, onUnmounted, PropType, toRef, watch,
-} from '@vue/composition-api';
+} from 'vue';
+import { map } from 'lodash';
+import { ImageEnhancementOutputs } from 'vue-media-annotator/use/useImageEnhancements';
 import { SetTimeFunc } from '../../use/useTimeObserver';
-import useMediaController from './useMediaController';
+import AnnotatorImageCursor from './AnnotatorImageCursor.vue';
+import useAnnotatorImageCursor from './useAnnotatorImageCursor';
+import { injectCameraInitializer } from './useMediaController';
 
 export interface ImageDataItem {
   url: string;
   filename: string;
 }
-
 interface ImageDataItemInternal extends ImageDataItem {
   image: HTMLImageElement;
   cached: boolean; // true if onloadPromise has resolved
   frame: number; // frame number this image belongs to
   onloadPromise: Promise<boolean>;
 }
-
 function loadImageFunc(imageDataItem: ImageDataItem, img: HTMLImageElement) {
   // eslint-disable-next-line no-param-reassign
   img.src = imageDataItem.url;
 }
-
 export default defineComponent({
   name: 'ImageAnnotator',
-
+  components: { AnnotatorImageCursor },
   props: {
     imageData: {
       type: Array as PropType<ImageDataItem[]>,
@@ -42,19 +43,52 @@ export default defineComponent({
       type: Function as PropType<(imageDataItem: ImageDataItem, img: HTMLImageElement) => void>,
       default: loadImageFunc,
     },
-    // Range is [0, inf.)
-    brightness: {
-      type: Number as PropType<number | undefined>,
-      default: undefined,
+    camera: {
+      type: String as PropType<string>,
+      default: 'singleCam',
+    },
+    imageEnhancementOutputs: {
+      type: Object as PropType<ImageEnhancementOutputs>,
+      default: () => ({
+        brightness: { slope: 1, intercept: 0 },
+        contrast: { slope: 1, intercept: 0.5 },
+        saturation: { values: 1 },
+        sharpen: { kernelMatrix: '0 -1 0 -1 5 -1 0 -1 0', divisor: 1 },
+      }),
+    },
+    isDefaultImage: {
+      type: Boolean as PropType<boolean>,
+      required: true,
+    },
+    filterId: {
+      type: String as PropType<string>,
+      default: 'imageEnhancements',
     },
   },
-
-  setup(props) {
+  setup(props, { emit }) {
     const loadingVideo = ref(false);
     const loadingImage = ref(true);
-    const commonMedia = useMediaController();
-    const { data } = commonMedia;
+    const cameraInitializer = injectCameraInitializer();
+    const {
+      state: data,
+      geoViewer,
+      cursorHandler,
+      imageCursor,
+      container,
+      initializeViewer,
+      mediaController,
+      externallyDriven,
+    } = cameraInitializer(props.camera, 'image-sequence', {
+      // allow hoisting for these functions to pass a reference before defining them.
+      seek, pause, play, setVolume: unimplemented, setSpeed: unimplemented,
+    });
+    const { playbackCursor } = useAnnotatorImageCursor(
+      toRef(data, 'imageCursor'),
+      toRef(data, 'cursor'),
+      toRef(data, 'imageCursorEditing'),
+    );
     data.maxFrame = props.imageData.length - 1;
+    data.filenames = map(props.imageData, 'filename');
     // Below are configuration settings we can set until we decide on good numbers to utilize.
     let local = {
       playCache: 1, // seconds required to be fully cached before playback
@@ -68,7 +102,6 @@ export default defineComponent({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       quadFeature: undefined as any,
     };
-
     function forceUnload(imgInternal: ImageDataItemInternal) {
       // Removal from list indicates we are no longer attempting to load this image
       local.imgs[imgInternal.frame] = undefined;
@@ -77,14 +110,11 @@ export default defineComponent({
       imgInternal.image.src = '';
       local.pendingImgs.delete(imgInternal);
     }
-
-
     /**
      * When the component is unmounted, cancel all outstanding
      * requests for image load.
      */
     onUnmounted(() => Array.from(local.pendingImgs).forEach(forceUnload));
-
     /**
      * expectFrame when you know local.imgs[i] should not be undefined
      */
@@ -95,13 +125,24 @@ export default defineComponent({
       }
       return imgInternal;
     }
-
+    function failedToLoad(imgInternal: ImageDataItemInternal, loaded: boolean) {
+      if (loaded || local.imgs[imgInternal.frame] !== imgInternal) {
+        return false;
+      }
+      loadingImage.value = false;
+      emit('load-error', `Could not load ${imgInternal.filename}. The file may have been moved or deleted.`);
+      return true;
+    }
     /**
      * Draw image to the GeoJS map, and update the map dimensions if they have changed.
      */
     function drawImage(img: HTMLImageElement) {
       if (!data.ready) {
         return;
+      }
+      if (img.naturalHeight > 40960 || img.naturalWidth > 40960) {
+        // Warn about large images and conversion if possible
+        emit('large-image-warning', true);
       }
       if (
         img.naturalWidth > 0
@@ -114,7 +155,7 @@ export default defineComponent({
          */
         local.width = img.naturalWidth;
         local.height = img.naturalHeight;
-        commonMedia.resetMapDimensions(local.width, local.height);
+        mediaController.resetMapDimensions(local.width, local.height);
       }
       local.quadFeature
         .data([
@@ -125,8 +166,8 @@ export default defineComponent({
           },
         ])
         .draw();
+      data.imageRevision += 1;
     }
-
     /**
      * Adds a single frame to the pendingImgs array for loading and assigns it to the main
      * imgs list. Once the image is loaded it is removed from the pendingImgs
@@ -158,7 +199,6 @@ export default defineComponent({
       }
       return expectFrame(i);
     }
-
     /**
      * Caches a new range of frames to load in a forward->back pattern from the current frame
      * This allows for easily seeking backwards after seeking initially
@@ -174,7 +214,6 @@ export default defineComponent({
         }
       }
     }
-
     /**
      * Begins loading a set of images around the current frame.  If the image is not playing
      * it will give priority tothe currently loaded frame
@@ -208,10 +247,26 @@ export default defineComponent({
         cacheNewRange(min, max);
       }
     }
-
-    async function seek(f: number) {
+    async function seek(f: number | undefined) {
       if (!data.ready) {
         return;
+      }
+      if (f === undefined) {
+        // No frame for this camera at the current aligned-timeline slot: blank
+        // the pane. Deliberately leaves data.frame/data.filename untouched --
+        // those are read elsewhere (e.g. annotation-overlay lookups) and this
+        // phase doesn't touch annotation storage.
+        data.hasFrame = false;
+        if (local.quadFeature !== undefined) {
+          local.quadFeature.layer().node().css('visibility', 'hidden');
+        }
+        return;
+      }
+      if (!data.hasFrame) {
+        data.hasFrame = true;
+        if (local.quadFeature !== undefined) {
+          local.quadFeature.layer().node().css('visibility', '');
+        }
       }
       let newFrame = f;
       if (f < 0) newFrame = 0;
@@ -223,17 +278,15 @@ export default defineComponent({
       if (data.frame !== 0 && local.lastFrame === data.frame) {
         return;
       }
-
       props.updateTime(data);
-
       cacheImages();
       const imgInternal = expectFrame(newFrame);
       drawImage(imgInternal.image);
       if (!imgInternal.cached) {
         loadingImage.value = true;
         // else wait for it to load
-        await imgInternal.onloadPromise;
-        if (imgInternal.frame === data.frame) {
+        const loaded = await imgInternal.onloadPromise;
+        if (imgInternal.frame === data.frame && !failedToLoad(imgInternal, loaded)) {
           loadingImage.value = false;
           // if the seek hasn't changed since the image completed loading, draw it.
           drawImage(imgInternal.image);
@@ -242,12 +295,11 @@ export default defineComponent({
         loadingImage.value = false;
       }
     }
-
     function pause() {
       data.playing = false;
       loadingVideo.value = false;
+      props.updateTime(data);
     }
-
     /**
      * Checks to see if there are enough cached images to play for X seconds.
      * @param frame start frame to look for.
@@ -260,7 +312,6 @@ export default defineComponent({
         .filter((img) => img?.cached === false)
         .map((img) => img?.onloadPromise);
     }
-
     /**
      * Handles playback of the image sequence
      * Image playback is based on framerate but will pause and wait for images to load
@@ -273,7 +324,7 @@ export default defineComponent({
         }
         // expectFrame is safe here because, even though this frame may never have been
         // seeked before, it is at MOST 1 frame away from a frame that has.
-        // So the correct behavior of this function implicitly requires that seek()
+        // The correct behavior of this function implicitly requires that seek()
         // always trigger caching for surrounding frames.
         const nextImage = expectFrame(nextFrame);
         if (!nextImage.cached) {
@@ -291,59 +342,82 @@ export default defineComponent({
       }
       return undefined;
     }
-
     async function play() {
       try {
         data.playing = true;
-        syncWithVideo(data.frame + 1);
+        // When a global aligned timeline is driving playback, the aggregate
+        // controller's own centralized tick calls seek() directly -- this
+        // camera must not also free-run its own loop.
+        if (!externallyDriven.value) {
+          syncWithVideo(data.frame + 1);
+        }
+        props.updateTime(data);
       } catch (ex) {
         console.error(ex);
       }
     }
-
     function unimplemented() {
       throw new Error('Method unimplemented!');
     }
-
-    const {
-      cursorHandler,
-      initializeViewer,
-      mediaController,
-    } = commonMedia.initialize({
-      seek,
-      play,
-      pause,
-      setVolume: unimplemented,
-      setSpeed: unimplemented,
-    });
-
-    const setBrightnessFilter = (on: boolean) => {
-      if (local.quadFeature !== undefined) {
-        local.quadFeature.layer().node().css('filter', on ? 'url(#brightness)' : '');
-      }
-    };
+    watch(
+      () => props.isDefaultImage,
+      () => {
+        if (local.quadFeature !== undefined) {
+          if (props.isDefaultImage) {
+            local.quadFeature.layer().node().css('filter', '');
+          } else {
+            local.quadFeature.layer().node().css('filter', `url(#${props.filterId})`);
+          }
+          data.imageRevision += 1;
+        }
+      },
+      { deep: true },
+    );
 
     if (local.imgs.length) {
       const imgInternal = cacheFrame(0);
-      imgInternal.onloadPromise.then(() => {
+      imgInternal.onloadPromise.then(async (loaded) => {
+        if (imgInternal.frame !== data.frame || failedToLoad(imgInternal, loaded)) {
+          return;
+        }
+        try {
+          await imgInternal.image.decode();
+        } catch (error) {
+          if (imgInternal.frame !== data.frame) {
+            return;
+          }
+          loadingImage.value = false;
+          emit('load-error', `Could not display ${imgInternal.filename}. Its resolution may be too large for this browser or hardware.`, true);
+          return;
+        }
+        if (imgInternal.frame !== data.frame) {
+          return;
+        }
         initializeViewer(imgInternal.image.naturalWidth, imgInternal.image.naturalHeight);
-        const quadFeatureLayer = commonMedia.geoViewerRef.value.createLayer('feature', {
+        const quadFeatureLayer = geoViewer.value.createLayer('feature', {
           features: ['quad'],
           autoshareRenderer: false,
+          renderer: 'canvas',
         });
-
         // Set quadFeature and conditionally apply brightness filter
         local.quadFeature = quadFeatureLayer.createFeature('quad');
-        setBrightnessFilter(props.brightness !== undefined);
+        local.quadFeature.layer().node().css('filter', `url(#${props.filterId})`);
         data.ready = true;
         seek(0);
       });
     }
-
     function init() {
       data.maxFrame = props.imageData.length - 1;
-
-      // Below are configuration settings we can set until we decide on good numbers to utilize.
+      data.filenames = map(props.imageData, 'filename');
+      // When the viewer already exists, an imageData change is a URL swap for
+      // the same camera (e.g. the percentile-stretch display remap). Rebuild
+      // only the image cache and redraw the current frame in place: calling
+      // initializeViewer again would replace the geojs map, orphaning every
+      // feature layer and event handler that other components (LayerManager
+      // and its annotation/calibration layers) attached to the old map. Any
+      // dimension change is already handled by drawImage/resetMapDimensions.
+      const reusableQuad = data.ready && geoViewer.value !== undefined
+        ? local.quadFeature : undefined;
       local = {
         playCache: 1, // seconds required to be fully cached before playback
         cacheSeconds: 6, // seconds to cache from the current frame
@@ -351,52 +425,70 @@ export default defineComponent({
         imgs: new Array<ImageDataItemInternal | undefined>(props.imageData.length),
         pendingImgs: new Set<ImageDataItemInternal>(),
         lastFrame: -1,
-        width: 0,
-        height: 0,
+        width: reusableQuad !== undefined ? local.width : 0,
+        height: reusableQuad !== undefined ? local.height : 0,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        quadFeature: undefined as any,
+        quadFeature: reusableQuad as any,
       };
-      if (local.imgs.length) {
-        const imgInternal = cacheFrame(0);
-        imgInternal.onloadPromise.then(() => {
-          initializeViewer(imgInternal.image.naturalWidth, imgInternal.image.naturalHeight);
-          const quadFeatureLayer = commonMedia.geoViewerRef.value.createLayer('feature', {
-            features: ['quad'],
-            autoshareRenderer: false,
-          });
-
-          // Set quadFeature and conditionally apply brightness filter
-          local.quadFeature = quadFeatureLayer.createFeature('quad');
-          setBrightnessFilter(props.brightness !== undefined);
-          data.ready = true;
-          seek(0);
-        });
+      if (!local.imgs.length) {
+        return;
       }
+      if (reusableQuad !== undefined) {
+        if (data.frame > data.maxFrame) {
+          data.frame = data.maxFrame;
+          data.syncedFrame = data.maxFrame;
+        }
+        data.filename = props.imageData[data.frame].filename;
+        // seek() short-circuits on a same-frame re-seek, so drive the redraw
+        // directly through the fresh cache.
+        cacheImages();
+        const imgInternal = expectFrame(data.frame);
+        drawImage(imgInternal.image);
+        if (!imgInternal.cached) {
+          loadingImage.value = true;
+          imgInternal.onloadPromise.then((loaded) => {
+            if (imgInternal.frame === data.frame && !failedToLoad(imgInternal, loaded)) {
+              loadingImage.value = false;
+              drawImage(imgInternal.image);
+            }
+          });
+        } else {
+          loadingImage.value = false;
+        }
+        return;
+      }
+      const imgInternal = cacheFrame(0);
+      imgInternal.onloadPromise.then((loaded) => {
+        if (failedToLoad(imgInternal, loaded)) {
+          return;
+        }
+        initializeViewer(imgInternal.image.naturalWidth, imgInternal.image.naturalHeight);
+        const quadFeatureLayer = geoViewer.value.createLayer('feature', {
+          features: ['quad'],
+          autoshareRenderer: false,
+          renderer: 'canvas',
+        });
+        // Set quadFeature and conditionally apply brightness filter
+        local.quadFeature = quadFeatureLayer.createFeature('quad');
+        data.ready = true;
+        seek(0);
+        if (!props.isDefaultImage) {
+          local.quadFeature.layer().node().css('filter', `url(#${props.filterId})`);
+        }
+      });
     }
-
     // Watch imageData for change
     watch(toRef(props, 'imageData'), () => {
       init();
     });
-
-    // Watch brightness for change, only set filter if value
-    // is switching from number -> undefined, or vice versa.
-    watch(toRef(props, 'brightness'), (brightness, oldBrightness) => {
-      if ((brightness === undefined) !== (oldBrightness === undefined)) {
-        setBrightnessFilter(brightness !== undefined);
-      }
-    });
-
-
     return {
       data,
       loadingVideo,
       loadingImage,
-      imageCursorRef: commonMedia.imageCursorRef,
-      containerRef: commonMedia.containerRef,
-      onResize: commonMedia.onResize,
+      playbackCursor,
+      imageCursorRef: imageCursor,
+      containerRef: container,
       cursorHandler,
-      mediaController,
     };
   },
 });
@@ -410,21 +502,57 @@ export default defineComponent({
       style="position: absolute; top: -1px; left: -1px"
     >
       <defs>
-        <filter id="brightness">
-          <feComponentTransfer color-interpolation-filters="sRGB">
+        <filter :id="filterId">
+          <feComponentTransfer id="feBrightness">
             <feFuncR
               type="linear"
-              :slope="brightness"
+              :slope="imageEnhancementOutputs.brightness.slope"
+              :intercept="imageEnhancementOutputs.brightness.intercept"
             />
             <feFuncG
               type="linear"
-              :slope="brightness"
+              :slope="imageEnhancementOutputs.brightness.slope"
+              :intercept="imageEnhancementOutputs.brightness.intercept"
             />
             <feFuncB
               type="linear"
-              :slope="brightness"
+              :slope="imageEnhancementOutputs.brightness.slope"
+              :intercept="imageEnhancementOutputs.brightness.intercept"
             />
           </feComponentTransfer>
+          <!-- Contrast -->
+          <feComponentTransfer id="feContrast">
+            <feFuncR
+              type="linear"
+              :slope="imageEnhancementOutputs.contrast.slope"
+              :intercept="imageEnhancementOutputs.contrast.intercept"
+            />
+            <feFuncG
+              type="linear"
+              :slope="imageEnhancementOutputs.contrast.slope"
+              :intercept="imageEnhancementOutputs.contrast.intercept"
+            />
+            <feFuncB
+              type="linear"
+              :slope="imageEnhancementOutputs.contrast.slope"
+              :intercept="imageEnhancementOutputs.contrast.intercept"
+            />
+          </feComponentTransfer>
+          <!-- Saturation -->
+          <feColorMatrix
+            id="feSaturate"
+            type="saturate"
+            :values="imageEnhancementOutputs.saturation.values.toString()"
+          />
+          <!-- Sharpening -->
+          <feConvolveMatrix
+            id="feSharpen"
+            order="3"
+            :divisor="imageEnhancementOutputs.sharpen.divisor"
+            :kernelMatrix="imageEnhancementOutputs.sharpen.kernelMatrix"
+            edgeMode="duplicate"
+          />
+          <feComposite in2="SourceGraphic" operator="in" />
         </filter>
       </defs>
     </svg>
@@ -432,12 +560,16 @@ export default defineComponent({
       ref="imageCursorRef"
       class="imageCursor"
     >
-      <v-icon> {{ data.imageCursor }} </v-icon>
+      <AnnotatorImageCursor
+        :image-cursor="data.imageCursor"
+        :image-cursor-editing="data.imageCursorEditing"
+        :cursor="data.cursor"
+      />
     </div>
     <div
       ref="containerRef"
       class="playback-container"
-      :style="{ cursor: data.cursor }"
+      :style="{ cursor: playbackCursor }"
       @mousemove="cursorHandler.handleMouseMove"
       @mouseleave="cursorHandler.handleMouseLeave"
       @mouseover="cursorHandler.handleMouseEnter"
@@ -454,12 +586,13 @@ export default defineComponent({
           Loading
         </v-progress-circular>
       </div>
+      <div
+        v-if="data.ready && !data.hasFrame"
+        class="no-frame-overlay"
+      >
+        No frame at this instant
+      </div>
     </div>
-    <slot
-      ref="control"
-      name="control"
-      @resize="onResize"
-    />
     <slot v-if="data.ready" />
   </div>
 </template>

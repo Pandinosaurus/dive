@@ -1,23 +1,77 @@
 <script lang="ts">
 import {
-  defineComponent, computed, PropType, ref, onBeforeMount,
-} from '@vue/composition-api';
+  computed,
+  defineComponent,
+  PropType,
+  ref,
+  Ref,
+  onBeforeMount,
+  onMounted,
+  onBeforeUnmount,
+  watch,
+} from 'vue';
 import {
   Pipelines,
   Pipe,
   useApi,
   SubType,
+  DatasetType,
+  NewDatasetJobConfig,
 } from 'dive-common/apispec';
 import JobLaunchDialog from 'dive-common/components/JobLaunchDialog.vue';
-import { stereoPipelineMarker, multiCamPipelineMarkers } from 'dive-common/constants';
+import SingleCameraAssociationDialog from 'dive-common/singleCamera/AssociationDialog.vue';
+import {
+  associationUnavailableReason, singleCameraContext, SingleCameraMode,
+} from 'dive-common/singleCamera';
+import { isStereoInteractiveModeEnabled } from 'dive-common/store/settings';
+import JobConfigFilterTranscodeDialog from 'dive-common/components/JobConfigFilterTranscodeDialog.vue';
+import RunPipelineToast from 'dive-common/components/RunPipelineToast.vue';
+import {
+  stereoPipelineMarker,
+  multiCamPipelineMarkers,
+  LargeImageType,
+} from 'dive-common/constants';
+import { parentDatasetId } from 'dive-common/compositeDatasetId';
+import { filterPipelinesForDatasets } from 'dive-common/pipelineMenuFilters';
+import {
+  pipelineDisabledForMissingCalibration,
+} from 'dive-common/pipelineCalibration';
+import { pipelineCreatesNewDataset } from 'dive-common/pipelineCreatesDataset';
+import { pipelineHasParams, pipelineRequiresParams } from 'dive-common/pipelineParams';
+import pipelineTypeDisplay from 'dive-common/pipelineTypeDisplay';
 import { useRequest } from 'dive-common/use';
+import { usePrompt } from 'dive-common/vue-utilities/prompt-service';
+import PipelineParamsDialog from 'dive-common/components/PipelineParamsDialog.vue';
+import PipelineCameraAssignDialog, {
+  PipelineCameraAssignRequest, PipelineCameraAssignResult,
+} from 'dive-common/components/PipelineCameraAssignDialog.vue';
+import { orderedMultiCamCameraNames } from 'dive-common/multicamDisplay';
+import {
+  CameraRole, defaultDialogCameraOrder, fittedRegistrationPairs, pipelineCameraSlots,
+} from 'dive-common/pipelineCameraOrder';
+import PipelineCalibrationWarningIcon from 'dive-common/components/PipelineCalibrationWarningIcon.vue';
+
+type MenuState = 'idle' | 'configuring';
 
 export default defineComponent({
   name: 'RunPipelineMenu',
 
-  components: { JobLaunchDialog },
+  components: {
+    JobLaunchDialog,
+    SingleCameraAssociationDialog,
+    JobConfigFilterTranscodeDialog,
+    PipelineParamsDialog,
+    PipelineCameraAssignDialog,
+    RunPipelineToast,
+    PipelineCalibrationWarningIcon,
+  },
 
   props: {
+    /** Persist viewer annotations before inspecting or consuming the other cameras. */
+    beforeRun: {
+      type: Function as PropType<() => Promise<void>>,
+      default: undefined,
+    },
     selectedDatasetIds: {
       type: Array as PropType<string[]>,
       default: () => [],
@@ -30,6 +84,11 @@ export default defineComponent({
       type: Object,
       default: () => ({}),
     },
+    /* Disable pipelines for large-image type */
+    typeList: {
+      type: Array as PropType<DatasetType[]>,
+      default: () => ([]),
+    },
     /* Which pipelines to show based on dataset subtypes */
     subTypeList: {
       type: Array as PropType<SubType[]>,
@@ -40,91 +99,440 @@ export default defineComponent({
       type: Array as PropType<number[]>,
       default: () => ([1]),
     },
+    runningPipelines: {
+      type: Array as PropType<string[]>,
+      default: () => ([]),
+    },
+    readOnlyMode: {
+      type: Boolean,
+      default: false,
+    },
+    /* When true, gray out the Run button and show jobsDisabledMessage as tooltip */
+    jobsDisabled: {
+      type: Boolean,
+      default: false,
+    },
+    jobsDisabledMessage: {
+      type: String,
+      default: '',
+    },
+    /* Time filter range from the viewer - [startFrame, endFrame] or null */
+    timeFilter: {
+      type: Array as unknown as PropType<[number, number] | null>,
+      default: null,
+    },
+    /** Case-insensitive substrings; matching categories/pipes are omitted from the menu. */
+    excludePipelineTerms: {
+      type: Array as PropType<string[]>,
+      default: () => ([]),
+    },
   },
 
   setup(props) {
-    const { runPipeline, getPipelineList } = useApi();
+    const { prompt } = usePrompt();
+    const {
+      runPipeline, getPipelineList, hasCalibrationFile, loadConfig, saveConfig, loadDetections,
+    } = useApi();
     const unsortedPipelines = ref({} as Pipelines);
-    const selectedPipe = ref(null as Pipe | null);
-    const camNumberStringArray = computed(() => props.cameraNumbers.map((v) => v.toString()));
     const {
       request: _runPipelineRequest,
       reset: dismissLaunchDialog,
       state: jobState,
     } = useRequest();
 
+    const menuState: Ref<MenuState> = ref('idle');
+    const configuring = computed(() => menuState.value === 'configuring');
+    const selectedPipeline: Ref<Pipe | null> = ref(null);
+    const associationCamera = ref('');
+    const associationUnavailable = ref('');
+    let resolveAssociation: (mode: SingleCameraMode | null) => void = () => {};
+    function answerAssociation(mode: SingleCameraMode | null) {
+      associationCamera.value = '';
+      associationUnavailable.value = '';
+      resolveAssociation(mode);
+    }
+    function askAssociation(camera: string, unavailableReason: string) {
+      return new Promise<SingleCameraMode | null>((resolve) => {
+        resolveAssociation = resolve;
+        associationUnavailable.value = unavailableReason;
+        associationCamera.value = camera;
+      });
+    }
+    const selectedPipelineName = computed(() => (selectedPipeline.value ? selectedPipeline.value.name : ''));
+    function cancelConfig() {
+      menuState.value = 'idle';
+    }
+    const showParamsDialog = ref(false);
+    const pipelineParams = ref<Record<string, string>>({});
+
+    function openDiveParamsDialog(pipeline: Pipe) {
+      selectedPipeline.value = pipeline;
+      const defaults: Record<string, string> = {};
+      pipeline?.metadata?.diveParams?.forEach((param) => {
+        defaults[param.key] = param.default;
+      });
+      pipelineParams.value = defaults;
+      showParamsDialog.value = true;
+    }
+
+    async function confirmPipelineExecution(updatedParams: Record<string, string>) {
+      const kwiverParamsById: Record<string, Record<string, string>> = {};
+
+      let datasetIds = props.selectedDatasetIds;
+      const pipe = selectedPipeline.value;
+      if (pipe) {
+        if (multiCamPipelineMarkers.includes(pipe.type)
+          || stereoPipelineMarker === pipe.type) {
+          datasetIds = props.selectedDatasetIds.map((item) => parentDatasetId(item));
+        }
+      }
+
+      datasetIds.forEach((id) => {
+        kwiverParamsById[id] = updatedParams;
+      });
+      showParamsDialog.value = false;
+      await _runPipelineOnSelectedItemInner(pipe!, undefined, undefined, kwiverParamsById);
+    }
+
+    const includesLargeImage = computed(() => props.typeList.includes(LargeImageType));
+
     const successMessage = computed(() => (
-      `Started ${selectedPipe.value?.name} on ${props.selectedDatasetIds.length} dataset(s).`));
+      `Started ${selectedPipeline.value?.name} on ${props.selectedDatasetIds.length} dataset(s).`));
 
     onBeforeMount(async () => {
       unsortedPipelines.value = await getPipelineList();
     });
 
-    const pipelines = computed(() => {
-      const sortedPipelines = {} as Pipelines;
-      Object.entries(unsortedPipelines.value).forEach(([name, category]) => {
-        category.pipes.sort((a, b) => {
-          const aName = a.name.toLowerCase();
-          const bName = b.name.toLowerCase();
-          if (aName > bName) {
-            return 1;
-          }
-          if (aName < bName) {
-            return -1;
-          }
-          return 0;
+    const calibrationAvailableByDatasetId = ref<Record<string, boolean>>({});
+    /** The datasets whose calibration status is looked up: one entry per parent. */
+    const calibrationParentIds = computed(
+      () => [...new Set(props.selectedDatasetIds.map((id) => parentDatasetId(id)))],
+    );
+
+    async function refreshCalibrationStatus() {
+      if (!hasCalibrationFile || calibrationParentIds.value.length === 0) {
+        calibrationAvailableByDatasetId.value = {};
+        return;
+      }
+      const entries = await Promise.all(
+        calibrationParentIds.value.map(async (datasetId) => {
+          const available = await hasCalibrationFile(datasetId);
+          return [datasetId, available] as const;
+        }),
+      );
+      calibrationAvailableByDatasetId.value = Object.fromEntries(entries);
+    }
+
+    // Watch the ids themselves, not the array: a parent that binds an inline
+    // `[datasetId]` hands over a new array on every re-render, and each lookup
+    // costs a folder read plus a per-item existence check.
+    watch(() => calibrationParentIds.value.join(','), () => {
+      refreshCalibrationStatus();
+    }, { immediate: true });
+
+    let removeCalibrationAssignedListener: (() => void) | null = null;
+
+    // Listen for calibration assignment from backend (desktop only)
+    onMounted(() => {
+      if (typeof window !== 'undefined' && window.diveDesktop) {
+        removeCalibrationAssignedListener = window.diveDesktop.on('calibration-assigned', () => {
+          // Refresh calibration status when a pipeline assigns a calibration to a dataset
+          refreshCalibrationStatus();
         });
-        // Filter out unsupported pipelines based on subTypeList
-        // measurement can only be operated on stereo subtypes
-        if (props.subTypeList.every((item) => item === 'stereo') && (name === stereoPipelineMarker)) {
-          sortedPipelines[name] = category;
-        } else if (props.subTypeList.every((item) => item === 'multicam') && (multiCamPipelineMarkers.includes(name))) {
-          const pipelineExpectedCameraCount = name.split('-')[0];
-          if (camNumberStringArray.value.includes(pipelineExpectedCameraCount)) {
-            sortedPipelines[name] = category;
-          }
-        } else if (props.subTypeList.every((item) => item === null)
-        && name !== stereoPipelineMarker && !multiCamPipelineMarkers.includes(name)) {
-          sortedPipelines[name] = category;
-        }
-      });
-      return sortedPipelines;
+      }
     });
 
-    const pipelinesNotRunnable = computed(() => (
-      props.selectedDatasetIds.length < 1 || pipelines.value === null
+    onBeforeUnmount(() => {
+      if (removeCalibrationAssignedListener) {
+        removeCalibrationAssignedListener();
+        removeCalibrationAssignedListener = null;
+      }
+    });
+
+    function isPipelineDisabledForCalibration(pipeline: Pipe) {
+      return pipelineDisabledForMissingCalibration(
+        pipeline,
+        calibrationAvailableByDatasetId.value,
+        props.selectedDatasetIds.map((id) => parentDatasetId(id)),
+      );
+    }
+
+    function pipelineTooltipDisabled(pipeline: Pipe) {
+      return !pipeline?.metadata?.description;
+    }
+
+    const pipelines = computed(() => filterPipelinesForDatasets(
+      unsortedPipelines.value,
+      props.subTypeList,
+      props.cameraNumbers,
+      props.typeList,
+      props.excludePipelineTerms,
     ));
 
-    async function runPipelineOnSelectedItem(pipeline: Pipe) {
+    /* Icon slots are reserved per category so the columns line up across rows. */
+    function categoryPipes(pipeType: string) {
+      return pipelines.value?.[pipeType]?.pipes ?? [];
+    }
+
+    function categoryHasParams(pipeType: string) {
+      return categoryPipes(pipeType).some(pipelineHasParams);
+    }
+
+    function categoryHasCalibrationWarning(pipeType: string) {
+      return categoryPipes(pipeType).some(isPipelineDisabledForCalibration);
+    }
+
+    const pipelinesNotRunnable = computed(() => (
+      props.selectedDatasetIds.length < 1
+      || pipelines.value === null
+      || props.jobsDisabled
+    ));
+
+    const pipelinesCurrentlyRunning = computed(
+      () => props.selectedDatasetIds.reduce((acc, item) => acc || props.runningPipelines.includes(item), false),
+    );
+
+    const runPipelineTooltip = computed(() => {
+      if (props.jobsDisabled) {
+        return props.jobsDisabledMessage || 'Jobs are temporarily disabled';
+      }
+      if (pipelinesCurrentlyRunning.value) {
+        return 'Pipeline is Currently running';
+      }
+      return 'Run CV algorithm pipelines on this data';
+    });
+
+    const singlePipelineValue = computed(() => {
+      if (props.selectedDatasetIds.length === 1) {
+        return props.runningPipelines.includes(props.selectedDatasetIds[0]);
+      }
+      return false;
+    });
+
+    // --- Multicam camera assignment -------------------------------------
+    // Before a 2-cam/3-cam run the user sees which dataset camera DIVE
+    // proposes for each pipeline input (by camera role, else by name) and
+    // confirms or corrects it. Nothing about the placement is inferred at
+    // run time behind their back.
+    const cameraAssignRequest = ref<PipelineCameraAssignRequest | null>(null);
+    let cameraAssignResolve: ((result: PipelineCameraAssignResult | null) => void) | null = null;
+
+    function askCameraAssignment(request: PipelineCameraAssignRequest) {
+      return new Promise<PipelineCameraAssignResult | null>((resolve) => {
+        cameraAssignResolve = resolve;
+        cameraAssignRequest.value = request;
+      });
+    }
+    function settleCameraAssignment(result: PipelineCameraAssignResult | null) {
+      cameraAssignRequest.value = null;
+      const resolve = cameraAssignResolve;
+      cameraAssignResolve = null;
+      resolve?.(result);
+    }
+
+    /**
+     * Confirmed input1..N camera order per dataset, or null when the user
+     * cancelled. Persists confirmed roles onto the dataset when asked so the
+     * next run (and other pipelines) prefill correctly.
+     */
+    async function confirmCameraOrders(
+      pipeline: Pipe,
+      datasetIds: string[],
+    ): Promise<Record<string, string[]> | null> {
+      const orders: Record<string, string[]> = {};
+      // eslint-disable-next-line no-restricted-syntax
+      for (const id of datasetIds) {
+        // eslint-disable-next-line no-await-in-loop
+        const config = await loadConfig(id);
+        const cameras = orderedMultiCamCameraNames(config.multiCamMedia);
+        if (!cameras.length) {
+          throw new Error(`${config.name} is not a multi-camera dataset`);
+        }
+        const slots = pipelineCameraSlots(pipeline.metadata?.cameraOrder, cameras.length);
+        if (slots.length !== cameras.length) {
+          throw new Error(`${pipeline.name} expects ${slots.length} cameras but ${config.name} has ${cameras.length} (${cameras.join(', ')})`);
+        }
+        const roles: Record<string, CameraRole> = config.cameraRoles ?? {};
+        // eslint-disable-next-line no-await-in-loop
+        const result = await askCameraAssignment({
+          datasetName: config.name,
+          pipelineName: pipeline.name,
+          slots,
+          cameras,
+          proposed: defaultDialogCameraOrder(slots, cameras, roles),
+          roles,
+          registrationWarps: pipeline.metadata?.registrationWarps ?? [],
+          fittedPairs: fittedRegistrationPairs(config.cameraHomographies),
+        });
+        if (!result) {
+          return null;
+        }
+        orders[id] = result.order;
+        if (result.roles) {
+          const merged = { ...roles, ...result.roles };
+          if (JSON.stringify(merged) !== JSON.stringify(roles)) {
+            // eslint-disable-next-line no-await-in-loop
+            await saveConfig(id, { cameraRoles: merged });
+          }
+        }
+      }
+      return orders;
+    }
+
+    async function _runPipelineOnSelectedItemInner(
+      pipeline: Pipe,
+      outputDatasetNameById?: Record<string, string>,
+      outputParentFolderId?: string,
+      kwiverParamsById?: Record<string, Record<string, string>>,
+    ) {
       if (props.selectedDatasetIds.length === 0) {
         throw new Error('No selected datasets to run on');
       }
-      selectedPipe.value = pipeline;
+      let datasetIds = props.selectedDatasetIds;
+      const singleCameraModes: Record<string, SingleCameraMode> = {};
+      if (!pipelineCreatesNewDataset(pipeline)
+        && !multiCamPipelineMarkers.includes(pipeline.type)
+        && stereoPipelineMarker !== pipeline.type) {
+        datasetIds = [...datasetIds];
+        try {
+          if (props.cameraNumbers.some((count) => count > 1)) await props.beforeRun?.();
+          const parents = new Set<string>();
+          for (let i = 0; i < datasetIds.length; i += 1) {
+            // eslint-disable-next-line no-await-in-loop
+            const context = await singleCameraContext({ loadConfig, loadDetections }, datasetIds[i]);
+            if (context) {
+              if (parents.has(context.parentId)) {
+                throw new Error('Select only one camera per dataset for a single-camera pipeline run.');
+              }
+              parents.add(context.parentId);
+              datasetIds[i] = context.datasetId;
+              let mode: SingleCameraMode | null = 'separate';
+              if (context.hasOtherTracks) {
+                // eslint-disable-next-line no-await-in-loop
+                const calibration = context.stereo && !!await hasCalibrationFile?.(context.parentId);
+                const unavailable = associationUnavailableReason(
+                  context.stereo,
+                  calibration,
+                  isStereoInteractiveModeEnabled(),
+                ) || '';
+                // eslint-disable-next-line no-await-in-loop
+                mode = await askAssociation(context.datasetId, unavailable);
+                if (!mode) return;
+              }
+              singleCameraModes[context.datasetId] = mode;
+            }
+          }
+        } catch (error) {
+          await prompt({ title: 'Cannot run pipeline', text: (error as Error).message });
+          return;
+        }
+      }
+      if (multiCamPipelineMarkers.includes(pipeline.type)
+      || stereoPipelineMarker === pipeline.type) {
+        datasetIds = props.selectedDatasetIds.map((item) => parentDatasetId(item));
+      }
+      let cameraOrderById: Record<string, string[]> = {};
+      if (multiCamPipelineMarkers.includes(pipeline.type)) {
+        const confirmed = await confirmCameraOrders(pipeline, datasetIds);
+        if (!confirmed) {
+          return;
+        }
+        cameraOrderById = confirmed;
+      }
+      selectedPipeline.value = pipeline;
+      const frameRange = props.timeFilter;
       await _runPipelineRequest(() => Promise.all(
-        props.selectedDatasetIds.map((id) => runPipeline(id, pipeline)),
+        datasetIds.map((id) => runPipeline(id, pipeline, {
+          runtimeParams: frameRange ? { frameRange } : undefined,
+          outputDatasetName: outputDatasetNameById?.[id],
+          outputParentFolderId,
+          kwiverParams: kwiverParamsById?.[id],
+          cameraOrder: cameraOrderById[id],
+          singleCameraMode: singleCameraModes[id],
+        })),
       ));
     }
 
-    function pipeTypeDisplay(pipeType: string) {
-      switch (pipeType) {
-        case 'trained':
-          return 'trained';
-        case 'utility':
-        case 'generate':
-          return 'utilities';
-        default:
-          return `${pipeType}s`;
+    async function runPipelineOnSelectedItem(pipeline: Pipe) {
+      if (isPipelineDisabledForCalibration(pipeline)) {
+        return;
+      }
+      // Only required params block the run; optional ones already hold the
+      // .pipe file's own values, and stay reachable from the gear.
+      if (pipelineRequiresParams(pipeline)) {
+        openDiveParamsDialog(pipeline);
+        return;
+      }
+      if (!pipelineCreatesNewDataset(pipeline)) {
+        _runPipelineOnSelectedItemInner(pipeline);
+      } else {
+        // If a pipeline creates datasets, open the configuration dialog
+        // to allow users to name that dataset
+        // This is relevant for filter and transcode pipeline types
+        // (including multicam filter_*_N-cam pipes categorized as 2-cam/3-cam)
+        selectedPipeline.value = pipeline;
+        menuState.value = 'configuring'; // force the dialog open
       }
     }
 
+    /**
+     * Handle a user confirming additional configuration for filter
+     * or transcode pipelines, which create new datasets.
+     */
+    async function exitPipelineConfig(config: NewDatasetJobConfig) {
+      menuState.value = 'idle'; // close the dialog
+      if (selectedPipeline.value) {
+        let nameByDatasetId = config.names;
+        // Multicam/stereo pipes run against the parent dataset id; remap names
+        // keyed by camera composite ids so the chosen name is applied.
+        if (multiCamPipelineMarkers.includes(selectedPipeline.value.type)
+          || stereoPipelineMarker === selectedPipeline.value.type) {
+          nameByDatasetId = {};
+          Object.entries(config.names).forEach(([id, name]) => {
+            nameByDatasetId[parentDatasetId(id)] = name;
+          });
+        }
+        _runPipelineOnSelectedItemInner(
+          selectedPipeline.value,
+          nameByDatasetId,
+          config.parentFolderId,
+        );
+      }
+      selectedPipeline.value = null; // reset selected pipeline state
+    }
+
     return {
+      associationCamera,
+      associationUnavailable,
+      answerAssociation,
       jobState,
       pipelines,
       pipelinesNotRunnable,
+      includesLargeImage,
       successMessage,
       dismissLaunchDialog,
-      pipeTypeDisplay,
+      pipeTypeDisplay: pipelineTypeDisplay,
       runPipelineOnSelectedItem,
+      pipelinesCurrentlyRunning,
+      runPipelineTooltip,
+      singlePipelineValue,
+      selectedPipeline,
+      selectedPipelineName,
+      configuring,
+      cancelConfig,
+      menuState,
+      exitPipelineConfig,
+      pipelineParams,
+      showParamsDialog,
+      confirmPipelineExecution,
+      isPipelineDisabledForCalibration,
+      pipelineTooltipDisabled,
+      openDiveParamsDialog,
+      pipelineHasParams,
+      categoryHasParams,
+      categoryHasCalibrationWarning,
+      cameraAssignRequest,
+      settleCameraAssignment,
     };
   },
 });
@@ -132,47 +540,106 @@ export default defineComponent({
 
 <template>
   <div>
+    <SingleCameraAssociationDialog
+      :camera="associationCamera"
+      :unavailable-reason="associationUnavailable"
+      @answer="answerAssociation"
+    />
     <v-menu
       max-width="230"
+      max-height="none"
+      content-class="pipeline-menu-content"
       v-bind="menuOptions"
       :close-on-content-click="false"
+      :disabled="jobsDisabled"
     >
-      <template v-slot:activator="{ on: menuOn }">
+      <template #activator="{ on: menuOn }">
         <v-tooltip
           bottom
-          :disabled="menuOptions.offsetX"
+          :disabled="menuOptions.offsetX && !jobsDisabled"
         >
           <template #activator="{ on: tooltipOn }">
-            <v-btn
-              v-bind="buttonOptions"
-              :disabled="pipelinesNotRunnable"
-              v-on="{ ...tooltipOn, ...menuOn }"
+            <!-- Wrapper keeps tooltip working when the button is disabled -->
+            <span
+              class="d-inline-block"
+              style="width: 100%"
+              v-on="tooltipOn"
             >
-              <v-icon>
-                mdi-pipe
-              </v-icon>
-              <span
-                v-show="!$vuetify.breakpoint.mdAndDown || buttonOptions.block"
-                class="pl-1"
+              <v-btn
+                v-bind="buttonOptions"
+                :disabled="pipelinesNotRunnable || buttonOptions.disabled"
+                :color="pipelinesCurrentlyRunning ? 'warning' : buttonOptions.color"
+                v-on="jobsDisabled ? {} : menuOn"
               >
-                Run pipeline
-              </span>
-              <v-spacer />
-              <v-icon v-if="menuOptions.right">
-                mdi-chevron-right
-              </v-icon>
-            </v-btn>
+                <v-icon> mdi-pipe </v-icon>
+                <span
+                  v-show="!$vuetify.breakpoint.mdAndDown || buttonOptions.block"
+                  class="pl-1"
+                >
+                  Run pipeline
+                </span>
+                <v-spacer />
+                <v-icon v-if="menuOptions.right">
+                  mdi-chevron-right
+                </v-icon>
+              </v-btn>
+            </span>
           </template>
-          <span>Run CV algorithm pipelines on this data</span>
+          <span>{{ runPipelineTooltip }}</span>
         </v-tooltip>
       </template>
 
       <template>
+        <v-card v-if="pipelinesCurrentlyRunning">
+          <v-card-title> Pipeline Running </v-card-title>
+          <v-card-text>
+            Data cannot be edited while a pipeline is queued.
+            Pipelines produce output that will replace the existing annotations.
+            You can check the status of your job or cancel it
+          </v-card-text>
+          <v-row class="pb-1">
+            <!-- Viewer Loaded with single Job Running -->
+            <v-btn
+              v-if="singlePipelineValue && singlePipelineValue !== true"
+              large
+              depressed
+              :href="singlePipelineValue"
+              target="_blank"
+              color="info"
+              class="ma-auto"
+            >
+              View Running Job
+            </v-btn>
+            <!-- Desktop Job Running or Home/DataBrowser View -->
+            <v-btn
+              v-else
+              large
+              depressed
+              to="/jobs"
+              color="info"
+              class="ma-auto"
+            >
+              View Running Job
+            </v-btn>
+          </v-row>
+        </v-card>
+        <v-card v-else-if="readOnlyMode">
+          <v-card-title> Read only Mode</v-card-title>
+          <v-card-text>
+            This Dataset is in ReadOnly Mode.  You cannot run pipelines on this dataset.
+          </v-card-text>
+        </v-card>
+        <v-card v-else-if="includesLargeImage">
+          <v-card-title> Large Image</v-card-title>
+          <v-card-text>
+            Pipelines are not supported yet for Large Images.
+          </v-card-text>
+        </v-card>
         <v-card
-          v-if="pipelines"
+          v-else-if="pipelines"
           outlined
         >
-          <v-card-title>
+          <v-card-title class="pb-2">
             VIAME Pipelines
           </v-card-title>
 
@@ -183,62 +650,198 @@ export default defineComponent({
               target="_blank"
             >docs</a>
             for more information about these options.
-          </v-card-text>
-          <v-row class="px-3">
-            <v-col
-              v-for="(pipeType) in Object.keys(pipelines)"
-              :key="pipeType"
-              cols="12"
-            >
-              <v-menu
+            <v-row class="px-3 pipeline-categories-row">
+              <v-col
+                v-for="(pipeType, categoryIndex) in Object.keys(pipelines)"
                 :key="pipeType"
-                offset-x
-                right
+                cols="12"
+                :class="{ 'pipeline-category-col--last': categoryIndex === Object.keys(pipelines).length - 1 }"
               >
-                <template v-slot:activator="{ on }">
-                  <v-btn
-                    depressed
-                    block
-                    v-on="on"
-                  >
-                    {{ pipeTypeDisplay(pipeType) }}
-                    <v-icon
-                      right
-                      color="accent"
-                      class="ml-2"
-                    >
-                      mdi-menu-right
-                    </v-icon>
-                  </v-btn>
-                </template>
-
-                <v-list
-                  dense
-                  outlined
-                  style="overflow-y:auto; max-height:85vh"
+                <v-menu
+                  :key="pipeType"
+                  offset-x
+                  right
+                  max-height="none"
+                  content-class="pipeline-menu-content"
                 >
-                  <v-list-item
-                    v-for="(pipeline) in pipelines[pipeType].pipes"
-                    :key="`${pipeline.name}-${pipeline.pipe}`"
-                    @click="runPipelineOnSelectedItem(pipeline)"
+                  <template #activator="{ on }">
+                    <v-btn
+                      depressed
+                      block
+                      v-on="on"
+                    >
+                      {{ pipeTypeDisplay(pipeType) }}
+                      <v-icon
+                        right
+                        color="accent"
+                        class="ml-2"
+                      >
+                        mdi-menu-right
+                      </v-icon>
+                    </v-btn>
+                  </template>
+
+                  <v-list
+                    dense
+                    outlined
+                    class="pipeline-submenu-list"
                   >
-                    <v-list-item-title class="font-weight-regular">
-                      {{ pipeline.name }}
-                    </v-list-item-title>
-                  </v-list-item>
-                </v-list>
-              </v-menu>
-            </v-col>
-          </v-row>
+                    <v-tooltip
+                      v-for="pipeline in pipelines[pipeType].pipes"
+                      :key="`${pipeline.name}-${pipeline.pipe}`"
+                      left
+                      :open-delay="250"
+                      :disabled="pipelineTooltipDisabled(pipeline)"
+                      max-width="400"
+                      content-class="pipeline-description-tooltip"
+                    >
+                      <template #activator="{ on, attrs }">
+                        <v-list-item
+                          v-bind="attrs"
+                          :class="{ 'pipeline-item--unavailable': isPipelineDisabledForCalibration(pipeline) }"
+                          v-on="on"
+                          @click="runPipelineOnSelectedItem(pipeline)"
+                        >
+                          <v-list-item-title class="font-weight-regular pipeline-item-title">
+                            <span class="pipeline-item-name">{{ pipeline.name }}</span>
+                            <span class="pipeline-item-actions">
+                              <span
+                                v-if="categoryHasCalibrationWarning(pipeType)"
+                                class="pipeline-item-action"
+                              >
+                                <PipelineCalibrationWarningIcon
+                                  v-if="isPipelineDisabledForCalibration(pipeline)"
+                                />
+                              </span>
+                              <span
+                                v-if="categoryHasParams(pipeType)"
+                                class="pipeline-item-action"
+                              >
+                                <!-- The gear is its own hit target: clicking it
+                                  configures, clicking anywhere else on the entry
+                                  runs with the pipeline's own defaults. -->
+                                <v-btn
+                                  v-if="pipelineHasParams(pipeline)"
+                                  icon
+                                  small
+                                  class="pipeline-params-button"
+                                  :aria-label="`Configure ${pipeline.name}`"
+                                  @click.stop="openDiveParamsDialog(pipeline)"
+                                >
+                                  <v-icon>mdi-cog-outline</v-icon>
+                                </v-btn>
+                              </span>
+                            </span>
+                          </v-list-item-title>
+                        </v-list-item>
+                      </template>
+                      <RunPipelineToast :pipeline="pipeline" />
+                    </v-tooltip>
+                  </v-list>
+                </v-menu>
+              </v-col>
+            </v-row>
+          </v-card-text>
         </v-card>
       </template>
     </v-menu>
     <JobLaunchDialog
       :value="jobState.count > 0"
       :loading="jobState.loading"
-      :error="jobState.error"
+      :error="jobState.error ?? undefined"
       :message="successMessage"
       @close="dismissLaunchDialog"
     />
+    <JobConfigFilterTranscodeDialog
+      :value="menuState === 'configuring'"
+      :pipeline-name="selectedPipelineName"
+      :selected-dataset-ids="selectedDatasetIds"
+      @cancel="cancelConfig"
+      @submit="exitPipelineConfig"
+    />
+    <PipelineParamsDialog
+      v-model="showParamsDialog"
+      :pipeline="selectedPipeline"
+      :params="pipelineParams"
+      @confirm="confirmPipelineExecution"
+    />
+    <PipelineCameraAssignDialog
+      :value="cameraAssignRequest !== null"
+      :request="cameraAssignRequest"
+      @cancel="settleCameraAssignment(null)"
+      @confirm="settleCameraAssignment($event)"
+    />
   </div>
 </template>
+
+<style>
+/* Vuetify sets overflow-y: auto on .v-menu__content; scroll only on the list */
+.pipeline-menu-content.v-menu__content {
+  overflow-y: visible;
+  overflow-x: visible;
+  contain: none;
+  max-height: none !important;
+}
+
+.pipeline-submenu-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* Otherwise the scrollbar is carved out of the width the menu already sized
+     itself to, and the widest rows overflow by that much. */
+  scrollbar-gutter: stable;
+}
+
+.pipeline-item-title.v-list-item__title {
+  display: flex;
+  align-items: center;
+}
+
+/* Truncates rather than pushing the icons out of their columns. */
+.pipeline-item-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pipeline-item-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  /* Keep the gear's hit area clear of the name, so a click meant for the name
+     does not land on the button. */
+  margin-left: 16px;
+}
+
+.pipeline-item-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+}
+
+.pipeline-item-action + .pipeline-item-action {
+  margin-left: 8px;
+}
+
+.pipeline-categories-row {
+  margin-top: -2px;
+}
+
+.pipeline-category-col--last {
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+}
+
+.pipeline-description-tooltip.v-tooltip__content {
+  background: #3a3a3a !important;
+  opacity: 1 !important;
+}
+
+.pipeline-item--unavailable {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: rgba(251, 140, 0, 0.08);
+}
+</style>

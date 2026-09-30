@@ -1,16 +1,22 @@
+<!-- eslint-disable vue/no-ref-as-operand -->
 <script lang="ts">
 import {
   computed, defineComponent, ref, shallowRef, toRef, watch, PropType, Ref,
-} from '@vue/composition-api';
-import { usePendingSaveCount, useHandler, useCheckedTypes } from 'vue-media-annotator/provides';
+} from 'vue';
+import {
+  usePendingSaveCount, useHandler, useTrackFilters, useRevisionId,
+} from 'vue-media-annotator/provides';
+import { buildPerCameraRegistrationFiles } from 'vue-media-annotator/alignedView/cameraRegistrationFiles';
+import { referenceCameraName } from 'dive-common/multicamDisplay';
 import AutosavePrompt from 'dive-common/components/AutosavePrompt.vue';
 import { useRequest } from 'dive-common/use';
 import {
   DatasetSourceMedia, getDataset, getDatasetMedia, getUri,
+  hasCalibrationFile, downloadCalibration,
 } from 'platform/web-girder/api';
-import { GirderMetadataStatic } from 'platform/web-girder/constants';
+import { GirderConfigStatic } from 'platform/web-girder/constants';
 import {
-  ImageSequenceType, MultiType, VideoType,
+  ImageSequenceType, LargeImageType, MultiType, VideoType,
 } from 'dive-common/constants';
 
 export default defineComponent({
@@ -18,6 +24,10 @@ export default defineComponent({
 
   props: {
     datasetIds: {
+      type: Array as PropType<string[]>,
+      default: () => [],
+    },
+    fileIds: {
       type: Array as PropType<string[]>,
       default: () => [],
     },
@@ -43,10 +53,12 @@ export default defineComponent({
     let save = () => Promise.resolve();
     let pendingSaveCount = ref(0);
     let checkedTypes = ref([] as readonly string[]);
+    let revisionId = ref(null as null | number);
     if (props.blockOnUnsaved) {
       save = useHandler().save;
       pendingSaveCount = usePendingSaveCount();
-      checkedTypes = useCheckedTypes();
+      checkedTypes = useTrackFilters().checkedTypes;
+      revisionId = useRevisionId();
     }
 
     async function doExport({ forceSave = false, url }: { url?: string; forceSave?: boolean }) {
@@ -70,15 +82,26 @@ export default defineComponent({
       }
     }
 
+    const isDownloadButtonDisplayed = computed(() => {
+      const datasetsSelected = props.datasetIds.length > 0;
+      const filesSelected = props.fileIds.length > 0;
+
+      return datasetsSelected !== filesSelected;
+    });
+
+    const isDatasetDownload = computed(() => props.datasetIds.length > 0 && props.fileIds.length === 0);
+    const isFilesDownload = computed(() => props.fileIds.length > 0 && props.datasetIds.length === 0);
+
     const menuOpen = ref(false);
     const excludeBelowThreshold = ref(true);
     const excludeUncheckedTypes = ref(false);
+    const cameraFileSupported = ref(false);
 
     const singleDataSetId: Ref<string|null> = ref(null);
-    const dataset = shallowRef(null as GirderMetadataStatic | null);
+    const dataset = shallowRef(null as GirderConfigStatic | null);
     const datasetMedia = shallowRef(null as DatasetSourceMedia | null);
     const { request, error } = useRequest();
-    const loadDatasetMeta = () => request(async () => {
+    const loadDatasetConfig = () => request(async () => {
       if (props.datasetIds.length > 1) {
         singleDataSetId.value = null;
         dataset.value = null;
@@ -90,35 +113,90 @@ export default defineComponent({
         if (dataset.value.type === 'video') {
           datasetMedia.value = (await getDatasetMedia(singleDataSetId.value)).data;
         }
+        cameraFileSupported.value = dataset.value.subType === 'stereo'
+          && await hasCalibrationFile(singleDataSetId.value);
+      } else {
+        cameraFileSupported.value = false;
       }
     });
-    watch([toRef(props, 'datasetIds'), menuOpen], loadDatasetMeta);
+    watch([toRef(props, 'datasetIds'), menuOpen], loadDatasetConfig);
 
     const exportUrls = computed(() => {
       const params = {
         excludeBelowThreshold: excludeBelowThreshold.value,
         typeFilter: excludeUncheckedTypes.value ? JSON.stringify(checkedTypes.value) : undefined,
       };
+      if (props.fileIds.length > 0) {
+        if (props.fileIds.length === 1) {
+          return {
+            exportAllUrl: getUri({
+              url: `item/${props.fileIds[0]}/download`,
+            }),
+          };
+        }
+        return {
+          exportAllUrl: getUri({
+            url: 'resource/download',
+            params: {
+              resources: JSON.stringify({ item: props.fileIds }),
+            },
+          }),
+        };
+      }
       if (singleDataSetId.value) {
+        const isMulticam = dataset.value?.type === MultiType;
+        let exportMediaUrl;
+        if (isMulticam) {
+          exportMediaUrl = undefined;
+        } else if (dataset.value?.type === 'video') {
+          exportMediaUrl = datasetMedia.value?.video?.url;
+        } else {
+          exportMediaUrl = getUri({
+            url: 'dive_dataset/export',
+            params: {
+              ...params,
+              includeDetections: false,
+              includeMedia: true,
+              folderIds: JSON.stringify([singleDataSetId.value]),
+            },
+          });
+        }
         return {
           exportAllUrl: getUri({
             url: 'dive_dataset/export',
-            params: { ...params, folderIds: JSON.stringify([singleDataSetId.value]) },
+            params: {
+              ...params,
+              folderIds: JSON.stringify([singleDataSetId.value]),
+              includeMedia: true,
+              includeDetections: true,
+            },
           }),
-          exportMediaUrl: dataset.value?.type === 'video'
-            ? datasetMedia.value?.video?.url
-            : getUri({
-              url: 'dive_dataset/export',
-              params: {
-                ...params,
-                includeDetections: false,
-                includeMedia: true,
-                folderIds: JSON.stringify([singleDataSetId.value]),
-              },
-            }),
+          exportMediaUrl,
           exportDetectionsUrl: getUri({
             url: 'dive_annotation/export',
-            params: { ...params, folderId: singleDataSetId.value },
+            params: {
+              ...params,
+              folderId: singleDataSetId.value,
+              revisionId: revisionId.value,
+            },
+          }),
+          exportDetectionsUrlTrackJSON: getUri({
+            url: 'dive_annotation/export',
+            params: {
+              ...params,
+              folderId: singleDataSetId.value,
+              revisionId: revisionId.value,
+              format: 'dive_json',
+            },
+          }),
+          exportDetectionsUrlCocoJSON: getUri({
+            url: 'dive_annotation/export',
+            params: {
+              ...params,
+              folderId: singleDataSetId.value,
+              revisionId: revisionId.value,
+              format: 'coco_json',
+            },
           }),
           exportConfigurationUrl: getUri({
             url: `dive_dataset/${singleDataSetId.value}/configuration`,
@@ -131,18 +209,83 @@ export default defineComponent({
           params: { folderIds: JSON.stringify(props.datasetIds) },
 
         }),
+        exportAllUrlDetections: getUri({
+          url: 'dive_dataset/export',
+          params: {
+            ...params,
+            folderIds: JSON.stringify(props.datasetIds),
+            includeDetections: true,
+            includeMedia: false,
+          },
+        }),
+
       };
     });
 
+    const isMulticamDataset = computed(() => dataset.value?.type === MultiType);
+
     const mediaType = computed(() => {
-      if (dataset.value === null) return null;
+      if (dataset.value === null || dataset.value.type === MultiType) return null;
       const { type } = dataset.value;
-      if (type === MultiType) throw new Error('Cannot export multicamera dataset');
       return {
         [ImageSequenceType]: 'Image Sequence',
         [VideoType]: 'Video',
+        [LargeImageType]: 'Tiled Images',
       }[type];
     });
+
+    async function prepareExport() {
+      if (isFilesDownload.value) {
+        menuOpen.value = false;
+        await doExport({ url: exportUrls.value && exportUrls.value.exportAllUrl });
+      } else {
+        menuOpen.value = true;
+      }
+    }
+
+    async function exportCameraFile() {
+      if (!singleDataSetId.value) {
+        return;
+      }
+      await request(async () => {
+        await downloadCalibration(singleDataSetId.value as string);
+        menuOpen.value = false;
+      });
+    }
+
+    // Per-camera registration files, built client-side from the
+    // dataset meta (the calibration persists there on web). Each pair files
+    // under its non-reference camera, matching the desktop's on-disk
+    // <camera>_to_<reference>_registration.json convention.
+    const registrationFiles = computed(() => {
+      const ds = dataset.value;
+      if (!ds || ds.type !== MultiType) {
+        return [];
+      }
+      return buildPerCameraRegistrationFiles({
+        homographies: ds.cameraHomographies ?? {},
+        observations: ds.cameraCorrespondences ?? {},
+        transformTypes: ds.cameraTransformTypes ?? {},
+        source: ds.cameraRegistrationSource ?? null,
+      }, referenceCameraName(ds.multiCamMedia));
+    });
+
+    function exportRegistration(camera: string) {
+      const match = registrationFiles.value.find((file) => file.camera === camera);
+      if (!match) {
+        return;
+      }
+      const blob = new Blob(
+        [JSON.stringify(match.body, null, 2)],
+        { type: 'application/json' },
+      );
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = match.name;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    }
 
     return {
       error,
@@ -151,11 +294,21 @@ export default defineComponent({
       excludeBelowThreshold,
       excludeUncheckedTypes,
       menuOpen,
+      prepareExport,
       exportUrls,
       checkedTypes,
+      revisionId,
       savePrompt,
       singleDataSetId,
       doExport,
+      isDownloadButtonDisplayed,
+      isDatasetDownload,
+      isFilesDownload,
+      isMulticamDataset,
+      cameraFileSupported,
+      exportCameraFile,
+      registrationFiles,
+      exportRegistration,
     };
   },
 });
@@ -165,6 +318,7 @@ export default defineComponent({
   <v-menu
     v-model="menuOpen"
     :close-on-content-click="false"
+    :open-on-click="false"
     :nudge-width="120"
     v-bind="menuOptions"
     max-width="280"
@@ -175,8 +329,10 @@ export default defineComponent({
           <v-btn
             class="ma-0"
             v-bind="buttonOptions"
-            :disabled="!datasetIds.length"
+            :disabled="!isDownloadButtonDisplayed"
             v-on="{ ...tooltipOn, ...menuOn }"
+
+            @click="prepareExport()"
           >
             <v-icon>
               mdi-download
@@ -188,12 +344,13 @@ export default defineComponent({
               Download
             </span>
             <v-spacer />
-            <v-icon v-if="menuOptions.right">
+            <v-icon v-if="menuOptions.right && isDatasetDownload">
               mdi-chevron-right
             </v-icon>
           </v-btn>
         </template>
-        <span>Download media and annotations</span>
+        <span v-if="isDatasetDownload">Download media and annotations</span>
+        <span v-else-if="isFilesDownload">Download selected files</span>
       </v-tooltip>
     </template>
     <template>
@@ -203,10 +360,18 @@ export default defineComponent({
       />
       <v-card
         outlined
+        class="downloadMenu"
       >
         <v-card-title>
           Download options
         </v-card-title>
+        <v-alert
+          v-if="revisionId"
+          type="info"
+          tile
+        >
+          Revision {{ revisionId }} selected
+        </v-alert>
         <v-alert
           v-if="error"
           color="error"
@@ -218,26 +383,33 @@ export default defineComponent({
           {{ error }}
         </v-alert>
 
-        <template v-if="dataset !== null && mediaType !== null">
-          <v-card-text class="pb-0">
-            Zip all {{ mediaType }} files only
-          </v-card-text>
-          <v-card-actions>
-            <v-btn
-              depressed
-              block
-              target="_blank"
-              rel="noopener"
-              :disabled="!exportUrls.exportMediaUrl"
-              :href="exportUrls.exportMediaUrl"
-            >
-              {{ mediaType }}
-            </v-btn>
-          </v-card-actions>
+        <template v-if="dataset !== null && (mediaType !== null || isMulticamDataset)">
+          <template v-if="mediaType !== null">
+            <v-card-text class="pb-0">
+              Zip all {{ mediaType }} files only
+            </v-card-text>
+            <v-card-actions>
+              <v-btn
+                depressed
+                block
+                target="_blank"
+                rel="noopener"
+                :disabled="!exportUrls.exportMediaUrl"
+                :href="exportUrls.exportMediaUrl"
+              >
+                {{ mediaType }}
+              </v-btn>
+            </v-card-actions>
+          </template>
 
           <v-card-text class="pb-2">
-            <div>Get latest detections csv only</div>
-            <template v-if="dataset.confidenceFilters">
+            <div v-if="isMulticamDataset">
+              Get latest annotations for all cameras (zip)
+            </div>
+            <div v-else>
+              Get latest annotation csv only
+            </div>
+            <template v-if="dataset.confidenceFilters || true">
               <v-checkbox
                 v-model="excludeBelowThreshold"
                 label="exclude tracks below confidence threshold"
@@ -261,7 +433,7 @@ export default defineComponent({
                 v-model="excludeUncheckedTypes"
                 label="export checked types only"
                 dense
-                hint="Export only the track types currently enabled in the type filter"
+                hint="Export only stored confidence pairs whose raw type names are checked; other pairs are removed from exported tracks"
                 persistent-hint
                 class="pt-0"
               />
@@ -269,20 +441,71 @@ export default defineComponent({
           </v-card-text>
 
           <v-card-actions>
-            <v-btn
+            <v-row>
+              <v-col>
+                <v-btn
+                  depressed
+                  block
+                  :disabled="!exportUrls.exportDetectionsUrl"
+                  @click="doExport({ url: exportUrls && exportUrls.exportDetectionsUrl })"
+                >
+                  <span
+                    v-if="exportUrls.exportDetectionsUrl"
+                  >VIAME CSV</span>
+                  <span
+                    v-else
+                  >detections unavailable</span>
+                </v-btn>
+                <v-btn
+                  depressed
+                  block
+                  class="mt-2"
+                  :disabled="!exportUrls.exportDetectionsUrl"
+                  @click="doExport({
+                    url: exportUrls
+                      && exportUrls.exportDetectionsUrlCocoJSON,
+                  })"
+                >
+                  <span
+                    v-if="exportUrls.exportDetectionsUrl"
+                  >COCO JSON</span>
+                  <span
+                    v-else
+                  >detections unavailable</span>
+                </v-btn>
+                <v-btn
+                  depressed
+                  block
+                  class="mt-2"
+                  :disabled="!exportUrls.exportDetectionsUrl"
+                  @click="doExport({
+                    url: exportUrls
+                      && exportUrls.exportDetectionsUrlTrackJSON,
+                  })"
+                >
+                  <span
+                    v-if="exportUrls.exportDetectionsUrl"
+                  >DIVE JSON</span>
+                  <span
+                    v-else
+                  >detections unavailable</span>
+                </v-btn>
+                <!-- <v-btn
               depressed
               block
               :disabled="!exportUrls.exportDetectionsUrl"
               @click="doExport({ url: exportUrls && exportUrls.exportDetectionsUrl })"
             >
-              <span v-if="exportUrls.exportDetectionsUrl">detections</span>
+              <span v-if="exportUrls.exportDetectionsUrl">annotations</span>
               <span v-else>detections unavailable</span>
-            </v-btn>
+            </v-btn> -->
+              </v-col>
+            </v-row>
           </v-card-actions>
 
           <v-card-text class="pb-0">
             Export the dataset configuration, including
-            attribute definitions, types, styles, and thresholds.
+            attribute definitions, types, styles, thresholds, and dataset info.
           </v-card-text>
           <v-card-actions>
             <v-spacer />
@@ -295,8 +518,55 @@ export default defineComponent({
             </v-btn>
           </v-card-actions>
 
+          <template v-if="cameraFileSupported">
+            <v-card-text class="pb-0">
+              Download the stereo camera / calibration file currently associated
+              with this dataset.
+            </v-card-text>
+            <v-card-actions>
+              <v-spacer />
+              <v-btn
+                depressed
+                block
+                @click="exportCameraFile"
+              >
+                Camera File
+              </v-btn>
+            </v-card-actions>
+          </template>
+
+          <template v-if="registrationFiles.length">
+            <v-card-text class="pb-0">
+              Download the camera registration: one registration file per camera.
+            </v-card-text>
+            <v-card-actions>
+              <v-row>
+                <v-col>
+                  <v-btn
+                    v-for="file in registrationFiles"
+                    :key="file.camera"
+                    depressed
+                    block
+                    class="my-1"
+                    :title="`Registration: ${file.camera}${file.destination ? ` → ${file.destination}` : ''}`"
+                    @click="exportRegistration(file.camera)"
+                  >
+                    <span class="registration-export-btn__label">
+                      Registration: {{ file.camera }}{{ file.destination ? ` → ${file.destination}` : '' }}
+                    </span>
+                  </v-btn>
+                </v-col>
+              </v-row>
+            </v-card-actions>
+          </template>
+
           <v-card-text class="pb-0">
-            Zip all media, detections, and edit history recursively from all sub-folders
+            <span v-if="isMulticamDataset">
+              Zip all cameras: media, annotations, calibration, and dataset metadata
+            </span>
+            <span v-else>
+              Zip all media, detections, and edit history recursively from all sub-folders
+            </span>
           </v-card-text>
           <v-card-actions>
             <v-spacer />
@@ -323,8 +593,45 @@ export default defineComponent({
               Everything
             </v-btn>
           </v-card-actions>
+          <v-card-text class="pb-0">
+            Export All selected Dataset Detections in VIAME CSV and DIVE JSON
+          </v-card-text>
+          <v-checkbox
+            v-model="excludeBelowThreshold"
+            label="exclude tracks below confidence threshold"
+            dense
+            hide-details
+          />
+
+          <v-card-actions>
+            <v-spacer />
+            <v-btn
+              depressed
+              block
+              @click="doExport({ url: exportUrls && exportUrls.exportAllUrlDetections })"
+            >
+              Detections
+            </v-btn>
+          </v-card-actions>
         </template>
       </v-card>
     </template>
   </v-menu>
 </template>
+
+<style scoped>
+.downloadMenu {
+  max-height: calc(100vh - 30px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Long camera names overflow the block button otherwise; the full label is
+   still available via the button's native title tooltip on hover. */
+.registration-export-btn__label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+</style>

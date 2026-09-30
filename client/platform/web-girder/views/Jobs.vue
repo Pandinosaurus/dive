@@ -1,8 +1,12 @@
 <script lang="ts">
-import { defineComponent, ref } from '@vue/composition-api';
+import {
+  defineComponent, ref, watch,
+} from 'vue';
 import { GirderJobList } from '@girder/components/src';
 import { setUsePrivateQueue } from 'platform/web-girder/api';
 import { useGirderRest } from 'platform/web-girder/plugins/girder';
+import { useConfig } from '../store/useConfig';
+import { useJobs } from '../store/useJobs';
 
 export default defineComponent({
   name: 'Jobs',
@@ -11,6 +15,15 @@ export default defineComponent({
     const privateQueueEnabled = ref(false);
     const loading = ref(true);
     const restClient = useGirderRest();
+    const { distributedWorkerEnabled } = useConfig();
+    const { runningJobIds } = useJobs();
+    const outstandingJobs = ref(0);
+
+    watch(runningJobIds, () => {
+      restClient.get('job/queued').then(({ data }) => {
+        outstandingJobs.value = data.outstanding;
+      });
+    });
 
     async function setPrivateQueueEnabled(value: boolean) {
       loading.value = true;
@@ -24,10 +37,15 @@ export default defineComponent({
         privateQueueEnabled.value = user.user_private_queue_enabled;
         loading.value = false;
       });
+    restClient.get('job/queued').then(({ data }) => {
+      outstandingJobs.value = data.outstanding;
+    });
 
     return {
       privateQueueEnabled,
+      distributedWorkerEnabled,
       loading,
+      outstandingJobs,
       /* methods */
       setPrivateQueueEnabled,
     };
@@ -37,20 +55,27 @@ export default defineComponent({
 
 <template>
   <v-container :fluid="$vuetify.breakpoint.mdAndDown">
+    <v-alert
+      v-if="outstandingJobs"
+      type="warning"
+    >
+      There are {{ outstandingJobs }} jobs currently in the job queue (including yours).
+      Jobs will be processed in the order in which they are received.
+    </v-alert>
     <GirderJobList>
       <template #jobwidget="{ item }">
         <v-tooltip
           v-if="item.dataset_id"
           bottom
         >
-          <template #activator="{on, attrs}">
+          <template #activator="{ on, attrs }">
             <v-btn
               v-bind="attrs"
               x-small
               depressed
               :to="{ name: 'viewer', params: { id: item.dataset_id } }"
               color="info"
-              class="ml-0"
+              class="mr-2"
               v-on="on"
             >
               <v-icon small>
@@ -60,15 +85,38 @@ export default defineComponent({
           </template>
           <span>Launch dataset viewer</span>
         </v-tooltip>
+
+        <v-tooltip
+          v-if="item.type == 'export' && item.statusText == 'Success'"
+          bottom
+        >
+          <template #activator="{ on, attrs }">
+            <v-btn
+              v-bind="attrs"
+              x-small
+              depressed
+              :href="`/#/folder/${JSON.parse(item.kwargs).params.input_folder}`"
+              color="info"
+              class="mr-2"
+              v-on="on"
+            >
+              <v-icon small>
+                mdi-folder
+              </v-icon>
+            </v-btn>
+          </template>
+          <span>Navigate to exported file</span>
+        </v-tooltip>
+
         <v-tooltip bottom>
-          <template #activator="{on, attrs}">
+          <template #activator="{ on, attrs }">
             <v-btn
               v-bind="attrs"
               x-small
               depressed
               :href="`/girder/#job/${item._id}`"
               color="info"
-              class="mx-2"
+              class="mr-2"
               v-on="on"
             >
               <v-icon small>
@@ -98,6 +146,7 @@ export default defineComponent({
         </v-card-text>
       </v-card>
       <v-card
+        v-if="distributedWorkerEnabled"
         outlined
       >
         <v-card-title>
@@ -107,7 +156,7 @@ export default defineComponent({
           <p class="white--text">
             You can run your own personal, dedicated job runner anywhere you have
             compute resources. This could be a lab workstation or a cloud environment like
-            Google Cloud. You'll need a local installtion of VIAME.
+            Google Cloud. You'll need a local installation of VIAME.
           </p>
           <v-switch
             :input-value="privateQueueEnabled"
@@ -157,9 +206,11 @@ export default defineComponent({
       --gpus all \
       --ipc host \
       --volume "/opt/noaa/viame:/tmp/addons/extracted:ro" \
+      -e "WORKER_CONCURRENCY=2" \
       -e "DIVE_USERNAME=username" \
       -e "DIVE_PASSWORD=CHANGEME" \
-      kitware/viame-worker:latest</pre>
+      -e "DIVE_API_URL=https://viame.kitware.com/api/v1" \
+      kitware/viame-worker:gpu</pre>
         </v-card-text>
       </v-card>
     </v-card>

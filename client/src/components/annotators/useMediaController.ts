@@ -1,154 +1,567 @@
 // Reference used because of https://github.com/Microsoft/TypeScript/issues/28502
 /// <reference types="resize-observer-browser" />
-import geo from 'geojs';
-import {
-  ref, reactive, onMounted, onBeforeUnmount, provide, toRef, Ref,
-} from '@vue/composition-api';
+import geo, { GeoEvent } from 'geojs';
+import * as d3 from 'd3';
+
+import Vue, {
+  ref, shallowRef, reactive, provide, toRef, Ref, UnwrapRef, computed, watch,
+} from 'vue';
+import { map, over } from 'lodash';
+import createViewLink from './viewLink';
 
 import { use } from '../../provides';
-import type { MediaController } from './mediaControllerType';
+import type {
+  AggregateMediaController,
+  AlignedFrameResolver,
+  MediaController,
+  MediaControllerKind,
+} from './mediaControllerType';
+import type { CameraImage } from '../../layers/cameraImage';
 
-const MediaControllerSymbol = Symbol('media-controller');
+const AggregateControllerSymbol = Symbol('aggregate-controller');
+const CameraInitializerSymbol = Symbol('camera-initializer');
+const bus = new Vue();
+let allowCameraTrigger = true; // Used to prevent infinite loop on Camera Sync
 
-export function injectMediaController() {
-  return use<MediaController>(MediaControllerSymbol);
+interface MediaControllerReactiveData {
+  cameraName: string;
+  ready: boolean;
+  playing: boolean;
+  frame: number;
+  flick: number;
+  filename: string;
+  currentTime: number;
+  duration: number;
+  volume: number;
+  speed: number;
+  maxFrame: number;
+  filenames: string[];
+  syncedFrame: number;
+  /** False when an aligned-timeline slot has no frame for this camera; pane should blank. */
+  hasFrame: boolean;
+  /**
+   * Bumped whenever the annotator redraws its media quad: the async <img>
+   * swap after a seek finishes loading, an image-enhancement change (the
+   * percentile-stretch URL remap or the CSS filter toggle), or the initial
+   * video quad. Watchers that render a snapshot of the displayed element
+   * (the aligned-view warp, the registration ghost) rely on this as their
+   * only signal that the element changed -- every draw path must bump it.
+   */
+  imageRevision: number;
+  /**
+   * Composited overview texture for tiled large-image panes. Null for
+   * image-sequence / video. Assigned with markRaw (DOM canvas/image).
+   */
+  frameTexture: CameraImage | null;
+  cursor: string;
+  imageCursor: string;
+  imageCursorEditing: boolean;
+  originalBounds: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
 }
 
-export default function useMediaController() {
+interface CameraInitializerReturn {
+  state: UnwrapRef<MediaControllerReactiveData>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const geoViewerRef: Ref<any> = ref(undefined);
-  const containerRef: Ref<HTMLElement | undefined> = ref(undefined);
-  const imageCursorRef: Ref<HTMLElement | undefined> = ref(undefined);
+  geoViewer: Ref<any>;
+  container: Ref<HTMLElement | undefined>;
+  imageCursor: Ref<HTMLElement | undefined>;
+  cursorHandler: {
+    handleMouseLeave: () => void;
+    handleMouseEnter: () => void;
+    handleMouseMove: (evt: MouseEvent) => void;
+  };
+  initializeViewer: (width: number, height: number, tileWidth?: number,
+    tileHeight?: number, isMap?: boolean, geoSpatial?: boolean) => void;
+  mediaController: MediaController;
+  /**
+   * True whenever a global aligned timeline is driving playback (see
+   * AlignedFrameResolver) -- callers should skip starting their own internal
+   * frame-advance loop and rely on the aggregate controller's seek instead.
+   */
+  externallyDriven: Readonly<Ref<boolean>>;
+}
 
-  const data = reactive({
-    ready: false,
-    playing: false,
-    frame: 0,
-    flick: 0,
-    filename: '',
-    lockedCamera: false,
-    currentTime: 0,
-    duration: 0,
-    volume: 0,
-    speed: 1.0,
-    maxFrame: 0,
-    syncedFrame: 0,
-    observer: null,
-    cursor: 'default',
-    imageCursor: '',
-    originalBounds: {
-      left: 0,
-      top: 0,
-      bottom: 1,
-      right: 1,
+type CameraInitializerFunc = (cameraName: string, mediaKind: MediaControllerKind, {
+  seek, play, pause, setVolume, setSpeed,
+}: {
+  seek(frame: number | undefined): void;
+  play(): void;
+  pause(): void;
+  setVolume(level: number): void;
+  setSpeed(level: number): void;
+}) => CameraInitializerReturn;
+
+export function injectAggregateController() {
+  return use<Ref<AggregateMediaController>>(AggregateControllerSymbol);
+}
+
+export function injectCameraInitializer() {
+  return use<CameraInitializerFunc>(CameraInitializerSymbol);
+}
+
+export function useMediaController(options?: {
+  /** Shared with Viewer provide so the spinning SAM cursor stays visible. */
+  segmentationCursorLoading?: Ref<boolean>;
+}) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let geoViewers: Record<string, Ref<any>> = {};
+  let containers: Record<string, Ref<HTMLElement | undefined>> = {};
+  let imageCursors: Record<string, Ref<HTMLElement | undefined>> = {};
+  const cameras: Ref<symbol[]> = ref([]);
+  let subControllers: MediaController[] = [];
+  let state: Record<string, UnwrapRef<MediaControllerReactiveData>> = {};
+  let cameraControllerSymbols: Record<string, symbol> = {};
+  const synchronizeCameras: Ref<boolean> = ref(false);
+  const segmentationCursorLoading = options?.segmentationCursorLoading ?? ref(false);
+
+  // Installed by the viewer while stereo auto-compute is on; otherwise
+  // synchronised panes only copy each other's screen motion.
+  const viewLink = createViewLink({
+    center: (key) => geoViewers[key]?.value?.center(),
+    cameraName: (key) => state[key]?.cameraName,
+    synced: () => synchronizeCameras.value,
+    recenter: (sourceKey, point) => {
+      allowCameraTrigger = false;
+      Object.entries(geoViewers).forEach(([camera, geoViewer]) => {
+        if (geoViewer.value && camera !== sourceKey) {
+          geoViewer.value.center({ x: point[0], y: point[1] });
+        }
+      });
+      allowCameraTrigger = true;
     },
   });
-
-  function onResize() {
-    if (geoViewerRef.value === undefined || containerRef.value === undefined) {
-      return;
+  const resizeTrigger: Ref<number> = ref(0);
+  // Raised only while onResize applies its programmatic resetZoom, so the
+  // linked-viewer navigation and stereo view-link ignore the resulting
+  // pan/zoom events (see AggregateMediaController.resizing).
+  const resizing: Ref<boolean> = ref(false);
+  // shallowRef: an AlignedFrameResolver carries nested Refs (slotCount, frameRate)
+  // that must NOT be deep-reactive-converted/auto-unwrapped by a plain ref().
+  const alignedFrameResolver: Ref<AlignedFrameResolver | null> = shallowRef(null);
+  const alignedCurrentFrame: Ref<number> = ref(0);
+  const externallyDriven = computed(() => alignedFrameResolver.value !== null);
+  const alignedGapSlots = computed(() => alignedFrameResolver.value?.gapSlots.value ?? []);
+  let alignedPlaybackTimer: ReturnType<typeof setTimeout> | undefined;
+  const emptyControllerFrame = ref(0);
+  const emptyControllerMaxFrame = ref(0);
+  const emptyControllerPlaying = ref(false);
+  const emptyControllerSpeed = ref(1);
+  const emptyControllerVolume = ref(0);
+  const emptyControllerCurrentTime = ref(0);
+  const emptyControllerCameras = computed(() => [] as string[]);
+  const emptyAggregateController: AggregateMediaController = {
+    cameras: emptyControllerCameras,
+    maxFrame: emptyControllerMaxFrame,
+    frame: emptyControllerFrame,
+    seek: () => {},
+    nextFrame: () => {},
+    prevFrame: () => {},
+    volume: emptyControllerVolume,
+    setVolume: () => {},
+    speed: emptyControllerSpeed,
+    setSpeed: () => {},
+    pause: () => {},
+    play: () => {},
+    playing: emptyControllerPlaying,
+    resetZoom: () => {},
+    currentTime: emptyControllerCurrentTime,
+    getController,
+    toggleSynchronizeCameras,
+    setViewLinkResolver,
+    cameraSync: synchronizeCameras,
+    resizeTrigger,
+    resizing,
+    alignedGapSlots,
+    seekCameraFrame: aggregateSeekCameraFrame,
+    translateCameraFrame: aggregateTranslateCameraFrame,
+    cameraFrameToSlot: aggregateCameraFrameToSlot,
+  };
+  function stopAlignedPlaybackTimer() {
+    if (alignedPlaybackTimer !== undefined) {
+      clearTimeout(alignedPlaybackTimer);
+      alignedPlaybackTimer = undefined;
     }
-    const size = containerRef.value.getBoundingClientRect();
-    const mapSize = geoViewerRef.value.size();
-    if (size.width !== mapSize.width || size.height !== mapSize.height) {
+  }
+
+  /**
+   * Set (or clear, with null) the resolver that translates a global
+   * aligned-timeline slot into each camera's own local frame index. Called
+   * by Viewer.vue whenever its computed aligned timeline changes.
+   */
+  function setAlignedFrameResolver(resolver: AlignedFrameResolver | null) {
+    stopAlignedPlaybackTimer();
+    alignedFrameResolver.value = resolver;
+    if (resolver) {
+      // Immediately perform an aligned seek to slot 0 so that any camera with
+      // no frame at that slot blanks right away, rather than continuing to
+      // show its own local frame 0 until the first user-driven seek.
+      alignedSeek(resolver, 0);
+    } else {
+      alignedCurrentFrame.value = 0;
+    }
+  }
+
+  /**
+   * Re-apply the current aligned slot whenever the camera roster changes
+   * while a resolver is active. Annotators self-seek to their own local
+   * frame 0 during init (see ImageAnnotator's init()), so a camera that
+   * mounts after the resolver was installed would wrongly display its local
+   * frame 0 even when the current slot has no frame for it. flush: 'post'
+   * ensures this runs after the mounting annotator's own init-time seek.
+   * (Watch the length via a getter: under Vue 2.7 a shallow watch on the ref
+   * itself does not fire for in-place array mutation like push/splice.)
+   */
+  watch(() => cameras.value.length, () => {
+    const resolver = alignedFrameResolver.value;
+    if (resolver && cameras.value.length > 0) {
+      alignedSeek(resolver, alignedCurrentFrame.value);
+    }
+  }, { flush: 'post' });
+
+  function clear() {
+    Object.values(geoViewers).forEach((viewerRef) => {
+      const map = viewerRef?.value;
+      if (map && typeof map.exit === 'function') {
+        try {
+          map.exit();
+        } catch {
+          // Map may already be torn down with its DOM node.
+        }
+      }
+    });
+    geoViewers = {};
+    containers = {};
+    imageCursors = {};
+    cameras.value = [];
+    subControllers = [];
+    state = {};
+    cameraControllerSymbols = {};
+    setAlignedFrameResolver(null);
+  }
+
+  function getController(camera?: string) {
+    if (cameras.value.length === 0) {
+      throw new Error('no camera controllers currently exist');
+    }
+    if (camera === undefined) {
+      return subControllers[0];
+    }
+    const found = subControllers.find((c) => c.cameraName.value === camera);
+    if (!found) {
+      throw new Error('no controller found for that camera');
+    }
+    return found;
+  }
+
+  /**
+   * onResize resets the zoom of a camera when its window size changes.
+   */
+  function onResize() {
+    let resized = false;
+    const pendingResizes: (() => void)[] = [];
+    subControllers.forEach((mc) => {
+      const camera = cameraControllerSymbols[mc.cameraName.value].toString();
+      const geoViewerRef = geoViewers[camera];
+      const containerRef = containers[camera];
+      if (geoViewerRef.value === undefined || containerRef.value === undefined) {
+        return;
+      }
+      const size = containerRef.value.getBoundingClientRect();
+      const mapSize = geoViewerRef.value.size();
+      if (size.width !== mapSize.width || size.height !== mapSize.height) {
+        resized = true;
+        pendingResizes.push(() => {
+          if (geoViewerRef.value === undefined) {
+            return;
+          }
+          geoViewerRef.value.size(size);
+          mc.resetZoom();
+        });
+      }
+    });
+    // Resize maps first, then redraw annotation layers once GeoJS has settled.
+    if (resized) {
       window.requestAnimationFrame(() => {
-        geoViewerRef.value.size(size);
+        // resetZoom recenters each pane on its OWN native bounds and emits
+        // pan/zoom events synchronously. Suppress the linked-viewer navigation
+        // for the duration so a non-reference pane's native center isn't
+        // broadcast into the shared/reference space (which would strand warped
+        // panes on an empty corner). The resizeTrigger bump below then re-snaps
+        // every pane from a clean reference view.
+        resizing.value = true;
+        try {
+          pendingResizes.forEach((applyResize) => applyResize());
+        } finally {
+          resizing.value = false;
+        }
+        window.requestAnimationFrame(() => {
+          resizeTrigger.value += 1;
+        });
       });
     }
   }
 
-  function resetZoom() {
-    const zoomAndCenter = geoViewerRef.value.zoomAndCenterFromBounds(
-      data.originalBounds, 0,
-    );
-    geoViewerRef.value.zoom(zoomAndCenter.zoom);
-    geoViewerRef.value.center(zoomAndCenter.center);
+  function toggleSynchronizeCameras(val: boolean) {
+    synchronizeCameras.value = val;
   }
 
-  function toggleLockedCamera() {
-    data.lockedCamera = !data.lockedCamera;
+  function setViewLinkResolver(
+    resolver: Parameters<typeof viewLink.setResolver>[0],
+  ) {
+    viewLink.setResolver(resolver);
   }
 
-  function resetMapDimensions(width: number, height: number, margin = 0.3) {
-    geoViewerRef.value.bounds({
-      left: 0,
-      top: 0,
-      bottom: height,
-      right: width,
-    });
-    const params = geo.util.pixelCoordinateParams(
-      containerRef.value, width, height, width, height,
-    );
-    const { right, bottom } = params.map.maxBounds;
-    data.originalBounds = params.map.maxBounds;
-    geoViewerRef.value.maxBounds({
-      left: 0 - (right * margin),
-      top: 0 - (bottom * margin),
-      right: right * (1 + margin),
-      bottom: bottom * (1 + margin),
-    });
-    geoViewerRef.value.zoomRange({
-      // do not set a min limit so that bounds clamping determines min
-      min: -Infinity,
-      // 4x zoom max
-      max: 4,
-    });
-    geoViewerRef.value.clampBoundsX(true);
-    geoViewerRef.value.clampBoundsY(true);
-    geoViewerRef.value.clampZoom(true);
-    resetZoom();
+  /**
+   * Optional replacement for the aggregate "reset pan and zoom" behavior,
+   * installed by the aligned-view navigation link (useAlignedNavigation).
+   * While the aligned view is active every pane renders in the shared
+   * reference space, so resetting each pane to its own native bounds parks
+   * the view on an empty corner instead of the imagery. The override returns
+   * true when it handled the reset, false to fall back to the per-pane
+   * native reset. Lives in this closure (not on the aggregate object) so
+   * consumers that cached an earlier aggregate instance still route through
+   * it.
+   */
+  let resetZoomOverride: (() => boolean) | null = null;
+  function setResetZoomOverride(override: (() => boolean) | null) {
+    resetZoomOverride = override;
   }
 
-  let observer: ResizeObserver | null = null;
-  onMounted(() => {
-    if (containerRef.value) {
-      observer = new ResizeObserver(onResize);
-      observer.observe(containerRef.value);
-    } else {
-      throw new Error('Container was missing, could not register observer');
+  function aggregateResetZoom() {
+    if (resetZoomOverride && resetZoomOverride()) {
+      return;
     }
-  });
-  onBeforeUnmount(() => {
-    if (containerRef.value && observer !== null) {
-      observer.unobserve(containerRef.value);
-    } else {
-      throw new Error('Container or observer was missing');
+    subControllers.forEach((mc) => mc.resetZoom());
+  }
+
+  bus.$on('pan', (camEvent: {camera: string; event: GeoEvent}) => {
+    const activeMap = geoViewers[camEvent.camera]?.value;
+    if (activeMap !== undefined && synchronizeCameras.value) {
+      allowCameraTrigger = false;
+      Object.entries(geoViewers).forEach(([camera, geoViewer]) => {
+        if (geoViewer.value && camera !== camEvent.camera) {
+          geoViewer.value.pan(camEvent.event.screenDelta);
+        }
+      });
+      allowCameraTrigger = true;
+      // onResize's resetZoom emits pan/zoom in native space; skip the stereo
+      // lookup so a pane's native center isn't warped onto the other camera
+      // after the resize settles (same guard as aligned/registration nav).
+      if (!resizing.value) {
+        viewLink.schedule(camEvent.camera);
+      }
     }
   });
 
+  bus.$on('zoom', (camEvent: {camera: string; event: GeoEvent}) => {
+    const activeMap = geoViewers[camEvent.camera]?.value;
+    if (activeMap !== undefined && synchronizeCameras.value) {
+      allowCameraTrigger = false;
+      Object.entries(geoViewers).forEach(([camera, geoViewer]) => {
+        if (geoViewer.value && camera !== camEvent.camera) {
+          geoViewer.value.zoom(activeMap.zoom());
+        }
+      });
+      allowCameraTrigger = true;
+      if (!resizing.value) {
+        viewLink.schedule(camEvent.camera);
+      }
+    }
+  });
   /**
    * This secondary initialization wrapper solves a sort of
    * chicken-and-egg problem, allowing the function consumer to use
    * the state above to construct the dependencies for the methods below.
    */
-  function initialize({
-    seek, play, pause, setVolume, setSpeed,
+  function initialize(cameraName: string, mediaKind: MediaControllerKind, {
+    seek: _seek, play: _play, pause: _pause, setVolume: _setVolume, setSpeed: _setSpeed,
   }: {
-    seek(frame: number): void;
+    seek(frame: number | undefined): void;
     play(): void;
     pause(): void;
     setVolume(level: number): void;
     setSpeed(level: number): void;
   }) {
-    function setCursor(newCursor: string) {
-      data.cursor = `${newCursor}`;
+    // Clean up existing controller for this camera if it exists (e.g., when view mode switches)
+    const existingIndex = subControllers.findIndex((c) => c.cameraName.value === cameraName);
+    if (existingIndex !== -1) {
+      subControllers.splice(existingIndex, 1);
+      const existingSymbol = cameraControllerSymbols[cameraName];
+      if (existingSymbol) {
+        const existingCamera = existingSymbol.toString();
+        const cameraIndex = cameras.value.indexOf(existingSymbol);
+        if (cameraIndex !== -1) {
+          cameras.value.splice(cameraIndex, 1);
+        }
+        delete geoViewers[existingCamera];
+        delete containers[existingCamera];
+        delete imageCursors[existingCamera];
+        delete state[existingCamera];
+      }
     }
 
-    function setImageCursor(newCursor: string) {
-      data.imageCursor = `${newCursor}`;
+    const cameraSymbol = Symbol(`media-controller-${cameraName}`);
+    cameraControllerSymbols[cameraName] = cameraSymbol;
+    const camera = cameraSymbol.toString();
+    geoViewers[camera] = ref(undefined);
+    containers[camera] = ref(undefined);
+    imageCursors[camera] = ref(undefined);
+
+    state[camera] = reactive({
+      cameraName,
+      ready: false,
+      playing: false,
+      frame: 0,
+      flick: 0,
+      filename: '',
+      currentTime: 0,
+      duration: 0,
+      volume: 0,
+      speed: 1.0,
+      maxFrame: 0,
+      filenames: [],
+      syncedFrame: 0,
+      hasFrame: true,
+      imageRevision: 0,
+      frameTexture: null as CameraImage | null,
+      cursor: 'default',
+      imageCursor: '',
+      imageCursorEditing: false,
+      originalBounds: {
+        left: 0,
+        top: 0,
+        bottom: 1,
+        right: 1,
+      },
+    });
+
+    function setCursor(newCursor: string) {
+      if (state[camera]) {
+        state[camera].cursor = `${newCursor}`;
+      }
+    }
+
+    function setImageCursor(newCursor: string, editing = false) {
+      if (state[camera]) {
+        state[camera].imageCursor = `${newCursor}`;
+        state[camera].imageCursorEditing = editing;
+      }
     }
 
     function centerOn(coords: { x: number; y: number; z: number }) {
-      geoViewerRef.value.center(coords);
+      geoViewers[camera].value.center(coords);
     }
 
-    function initializeViewer(width: number, height: number) {
-      const params = geo.util.pixelCoordinateParams(
-        containerRef.value, width, height, width, height,
-      );
-      geoViewerRef.value = geo.map(params.map);
-      resetMapDimensions(width, height);
-      const interactorOpts = geoViewerRef.value.interactor().options();
+    function transition(coords: { x: number; y: number}, duration: number, zoom?: number) {
+      geoViewers[camera].value.transition({
+        center: { x: coords.x, y: coords.y },
+        zoom,
+        duration,
+        interp: d3.interpolateZoom,
+      });
+    }
+
+    function resetZoom() {
+      const geoViewerRef = geoViewers[camera];
+      const data = state[camera];
+      const zoomAndCenter = geoViewerRef.value.zoomAndCenterFromBounds(data.originalBounds, 0);
+      geoViewerRef.value.zoom(zoomAndCenter.zoom);
+      geoViewerRef.value.center(zoomAndCenter.center);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- retained for MediaController API compatibility
+    function resetMapDimensions(width: number, height: number, _isMap = false, margin = 0.3) {
+      const geoViewerRef = geoViewers[camera];
+      const containerRef = containers[camera];
+      const data = state[camera];
+      geoViewerRef.value.bounds({
+        left: 0,
+        top: 0,
+        bottom: height,
+        right: width,
+      });
+      const params = geo.util.pixelCoordinateParams(containerRef.value, width, height, width, height);
+      const { right, bottom } = params.map.maxBounds;
+      data.originalBounds = params.map.maxBounds;
+      geoViewerRef.value.maxBounds({
+        left: 0 - (right * margin),
+        top: 0 - (bottom * margin),
+        right: right * (1 + margin),
+        bottom: bottom * (1 + margin),
+      });
+      geoViewerRef.value.zoomRange({
+        // do not set a min limit so that bounds clamping determines min
+        min: -Infinity,
+        // 32x zoom max
+        max: 32,
+      });
+      // Multicam (including LargeImageAnnotator, which passes isMap=true) must
+      // turn clamp off so Align View can show a shared reference FOV that may
+      // exceed any one camera's native maxBounds. pixelCoordinateParams leaves
+      // clampZoom/clampBounds on by default; the old `if (!isMap)` guard skipped
+      // this for tiled panes and Align snaps were silently rejected.
+      // When a second camera registers, also unlock siblings that may still
+      // hold single-pane clamp from their earlier init.
+      // `_isMap` retained for MediaController API compatibility.
+      if (Object.keys(geoViewers).length === 1) {
+        geoViewerRef.value.clampBoundsX(true);
+        geoViewerRef.value.clampBoundsY(true);
+        geoViewerRef.value.clampZoom(true);
+      } else {
+        Object.values(geoViewers).forEach((viewerRef) => {
+          const map = viewerRef.value;
+          if (map && typeof map.clampZoom === 'function') {
+            map.clampBoundsX(false);
+            map.clampBoundsY(false);
+            map.clampZoom(false);
+          }
+        });
+      }
+      resetZoom();
+    }
+
+    function initializeViewer(
+      width: number,
+      height: number,
+      tileWidth: number | undefined = undefined,
+      tileHeight: number | undefined = undefined,
+      isMap = false,
+      geoSpatial = false,
+    ) {
+      if (tileHeight === undefined) {
+        // eslint-disable-next-line no-param-reassign
+        tileHeight = height;
+      }
+      if (tileWidth === undefined) {
+        // eslint-disable-next-line no-param-reassign
+        tileWidth = width;
+      }
+      // Tear down any previous map for this camera before allocating a new
+      // one. LargeImageAnnotator (and imageData watches) can re-init; without
+      // this, orphaned geoJS maps accumulate WebGL contexts until the browser
+      // starts dropping the oldest ones and annotation redraws blow up.
+      const previous = geoViewers[camera].value;
+      if (previous && typeof previous.exit === 'function') {
+        try {
+          previous.exit();
+        } catch {
+          // Map may already be partially torn down during a dataset reload.
+        }
+      }
+      let params = geo.util.pixelCoordinateParams(containers[camera].value, width, height, tileWidth, tileHeight);
+      if (isMap && geoSpatial) {
+        params = { map: { node: containers[camera].value } };
+      }
+      geoViewers[camera].value = geo.map(params.map);
+      if (!isMap || !geoSpatial) {
+        resetMapDimensions(width, height, isMap);
+      }
+      const interactorOpts = geoViewers[camera].value.interactor().options();
       interactorOpts.keyboard.focusHighlight = false;
       interactorOpts.keyboard.actions = {};
       interactorOpts.click.cancelOnMove = 5;
@@ -188,26 +601,44 @@ export default function useMediaController() {
         enabled: false,
       };
       interactorOpts.wheelScaleY = 0.2;
-      geoViewerRef.value.interactor().options(interactorOpts);
+      geoViewers[camera].value.interactor().options(interactorOpts);
+
+      //Add in bus control synchronization for cameras
+      geoViewers[camera].value.geoOn(geo.event.pan, (e: GeoEvent) => {
+        // Only trigger if not handling other camera interactions.
+        if (allowCameraTrigger) {
+          bus.$emit('pan', { camera: camera.toString(), event: e });
+        }
+      });
+      geoViewers[camera].value.geoOn(geo.event.zoom, (e: GeoEvent) => {
+        // Only trigger if not handling other camera interactions.
+        if (allowCameraTrigger) {
+          bus.$emit('zoom', { camera: camera.toString(), event: e });
+        }
+      });
     }
 
     function prevFrame() {
-      const targetFrame = data.frame - 1;
+      const targetFrame = state[camera].frame - 1;
       if (targetFrame >= 0) {
-        seek(targetFrame);
+        _seek(targetFrame);
       }
     }
 
     function nextFrame() {
-      const targetFrame = data.frame + 1;
-      if (targetFrame <= data.maxFrame) {
-        seek(targetFrame);
+      const targetFrame = state[camera].frame + 1;
+      if (targetFrame <= state[camera].maxFrame) {
+        _seek(targetFrame);
       }
     }
 
+    const imageCursorRef = imageCursors[camera];
+
     const cursorHandler = {
       handleMouseLeave() {
-        if (imageCursorRef.value) {
+        // Keep the spinning SAM cursor visible even if the pointer leaves the
+        // pane (e.g. while a long CPU prepare/predict runs).
+        if (imageCursorRef.value && !segmentationCursorLoading.value) {
           imageCursorRef.value.style.display = 'none';
         }
       },
@@ -227,49 +658,239 @@ export default function useMediaController() {
       },
     };
 
+    watch(segmentationCursorLoading, (loading) => {
+      if (loading && imageCursorRef.value) {
+        imageCursorRef.value.style.display = 'block';
+      }
+    });
+
     const mediaController: MediaController = {
-      geoViewerRef,
-      currentTime: toRef(data, 'currentTime'),
-      playing: toRef(data, 'playing'),
-      frame: toRef(data, 'frame'),
-      flick: toRef(data, 'flick'),
-      filename: toRef(data, 'filename'),
-      lockedCamera: toRef(data, 'lockedCamera'),
-      duration: toRef(data, 'duration'),
-      volume: toRef(data, 'volume'),
-      maxFrame: toRef(data, 'maxFrame'),
-      speed: toRef(data, 'speed'),
-      syncedFrame: toRef(data, 'syncedFrame'),
+      mediaKind,
+      ready: toRef(state[camera], 'ready'),
+      geoViewerRef: geoViewers[camera],
+      cameraName: toRef(state[camera], 'cameraName'),
+      cameras: ref([]),
+      currentTime: toRef(state[camera], 'currentTime'),
+      playing: toRef(state[camera], 'playing'),
+      frame: toRef(state[camera], 'frame'),
+      flick: toRef(state[camera], 'flick'),
+      filename: toRef(state[camera], 'filename'),
+      filenames: toRef(state[camera], 'filenames'),
+      duration: toRef(state[camera], 'duration'),
+      volume: toRef(state[camera], 'volume'),
+      maxFrame: toRef(state[camera], 'maxFrame'),
+      speed: toRef(state[camera], 'speed'),
+      syncedFrame: toRef(state[camera], 'syncedFrame'),
+      hasFrame: toRef(state[camera], 'hasFrame'),
+      imageRevision: toRef(state[camera], 'imageRevision'),
+      frameTexture: toRef(state[camera], 'frameTexture'),
+      originalBounds: toRef(state[camera], 'originalBounds'),
       prevFrame,
       nextFrame,
-      play,
-      pause,
-      seek,
+      play: _play,
+      pause: _pause,
+      seek: _seek,
       resetZoom,
-      toggleLockedCamera,
       centerOn,
+      transition,
       setCursor,
       setImageCursor,
-      setVolume,
-      setSpeed,
+      setVolume: _setVolume,
+      setSpeed: _setSpeed,
+      getController,
+      resetMapDimensions,
+      toggleSynchronizeCameras,
+      setViewLinkResolver,
+      cameraSync: synchronizeCameras,
+      resizeTrigger,
+      resizing,
+      alignedGapSlots,
+      seekCameraFrame: aggregateSeekCameraFrame,
+      translateCameraFrame: aggregateTranslateCameraFrame,
+      cameraFrameToSlot: aggregateCameraFrameToSlot,
     };
 
-    provide(MediaControllerSymbol, mediaController);
+    subControllers.push(mediaController);
+    cameras.value.push(cameraSymbol);
 
     return {
+      state: state[camera],
+      geoViewer: geoViewers[camera],
+      container: containers[camera],
+      imageCursor: imageCursors[camera],
       cursorHandler,
       initializeViewer,
       mediaController,
+      externallyDriven,
     };
   }
 
+  /** Seeks every camera to its own local frame for the given global aligned-timeline slot. */
+  function alignedSeek(resolver: AlignedFrameResolver, rawFrame: number) {
+    const maxFrame = Math.max(0, resolver.slotCount.value - 1);
+    const clamped = Math.min(Math.max(rawFrame, 0), maxFrame);
+    alignedCurrentFrame.value = clamped;
+    const perCamera = resolver.resolveSlot(clamped);
+    subControllers.forEach((mc) => {
+      mc.seek(perCamera[mc.cameraName.value]);
+    });
+  }
+
+  function aggregateSeek(frame: number) {
+    const resolver = alignedFrameResolver.value;
+    if (resolver) {
+      alignedSeek(resolver, frame);
+    } else {
+      subControllers.forEach((mc) => mc.seek(frame));
+    }
+  }
+
+  /**
+   * Seeks so that `camera` lands on its own local frame `localFrame`. Without
+   * alignment, local and global frame numbers are identical (today's
+   * positional broadcast), so this is just aggregateSeek. Under an aligned
+   * timeline, translates through the global slot via resolveGlobalSlot so
+   * every camera stays aligned; falls back to seeking only `camera` itself
+   * if that local frame isn't part of any slot (shouldn't normally happen).
+   */
+  function aggregateSeekCameraFrame(camera: string, localFrame: number) {
+    const resolver = alignedFrameResolver.value;
+    if (!resolver) {
+      aggregateSeek(localFrame);
+      return;
+    }
+    const slot = resolver.resolveGlobalSlot(camera, localFrame);
+    if (slot !== undefined) {
+      alignedSeek(resolver, slot);
+    } else {
+      getController(camera).seek(localFrame);
+    }
+  }
+
+  /**
+   * Same-capture translation between two cameras' local frame spaces (see
+   * AggregateMediaController.translateCameraFrame). Without an aligned
+   * timeline the spaces are identical, so the frame passes through.
+   */
+  function aggregateTranslateCameraFrame(from: string, localFrame: number, to: string): number | undefined {
+    if (from === to) {
+      return localFrame;
+    }
+    const resolver = alignedFrameResolver.value;
+    if (!resolver) {
+      return localFrame;
+    }
+    const slot = resolver.resolveGlobalSlot(from, localFrame);
+    return slot === undefined ? undefined : resolver.resolveSlot(slot)[to];
+  }
+
+  /**
+   * A camera's local frame expressed as a global slot (see
+   * AggregateMediaController.cameraFrameToSlot).
+   */
+  function aggregateCameraFrameToSlot(camera: string, localFrame: number): number | undefined {
+    const resolver = alignedFrameResolver.value;
+    return resolver ? resolver.resolveGlobalSlot(camera, localFrame) : localFrame;
+  }
+
+  function aggregateNextFrame() {
+    const resolver = alignedFrameResolver.value;
+    if (resolver) {
+      alignedSeek(resolver, alignedCurrentFrame.value + 1);
+    } else {
+      subControllers.forEach((mc) => mc.nextFrame());
+    }
+  }
+
+  function aggregatePrevFrame() {
+    const resolver = alignedFrameResolver.value;
+    if (resolver) {
+      alignedSeek(resolver, alignedCurrentFrame.value - 1);
+    } else {
+      subControllers.forEach((mc) => mc.prevFrame());
+    }
+  }
+
+  function aggregatePause() {
+    subControllers.forEach((mc) => mc.pause());
+    stopAlignedPlaybackTimer();
+  }
+
+  function aggregatePlay() {
+    // Each camera still flips its own `playing` UI state; when a resolver is
+    // set, ImageAnnotator/VideoAnnotator skip starting their own internal
+    // frame-advance loop (see externallyDriven) and this centralized tick
+    // drives seeks instead.
+    subControllers.forEach((mc) => mc.play());
+    const resolver = alignedFrameResolver.value;
+    if (!resolver) {
+      return;
+    }
+    stopAlignedPlaybackTimer();
+    const tick = () => {
+      const maxFrame = Math.max(0, resolver.slotCount.value - 1);
+      if (alignedCurrentFrame.value >= maxFrame) {
+        aggregatePause();
+        return;
+      }
+      alignedSeek(resolver, alignedCurrentFrame.value + 1);
+      alignedPlaybackTimer = setTimeout(tick, 1000 / Math.max(1, resolver.frameRate.value));
+    };
+    alignedPlaybackTimer = setTimeout(tick, 1000 / Math.max(1, resolver.frameRate.value));
+  }
+
+  const aggregateController: Ref<AggregateMediaController> = computed(() => {
+    if (cameras.value.length === 0) {
+      // During reload the controllers are cleared before new ones are created.
+      // Return a stub so watchers (e.g. LayerManager resizeTrigger) do not throw.
+      return emptyAggregateController;
+    }
+    const defaultController = getController();
+    const resolver = alignedFrameResolver.value;
+    return {
+      cameras: computed(() => cameras.value.map((v) => String(v))),
+      maxFrame: resolver
+        ? computed(() => Math.max(0, resolver.slotCount.value - 1))
+        : defaultController.maxFrame,
+      frame: resolver ? alignedCurrentFrame : defaultController.frame,
+      seek: aggregateSeek,
+      nextFrame: aggregateNextFrame,
+      prevFrame: aggregatePrevFrame,
+      volume: defaultController.volume,
+      setVolume: over(map(subControllers, 'setVolume')),
+      speed: defaultController.speed,
+      setSpeed: over(map(subControllers, 'setSpeed')),
+      pause: aggregatePause,
+      play: aggregatePlay,
+      playing: defaultController.playing,
+      resetZoom: aggregateResetZoom,
+      currentTime: defaultController.currentTime,
+      getController,
+      toggleSynchronizeCameras,
+      setViewLinkResolver,
+      cameraSync: synchronizeCameras,
+      resizeTrigger,
+      resizing,
+      alignedGapSlots,
+      seekCameraFrame: aggregateSeekCameraFrame,
+      translateCameraFrame: aggregateTranslateCameraFrame,
+      cameraFrameToSlot: aggregateCameraFrameToSlot,
+    };
+  });
+
+  provide(AggregateControllerSymbol, aggregateController as Ref<AggregateMediaController>);
+  provide(CameraInitializerSymbol, initialize as CameraInitializerFunc);
+
   return {
-    containerRef,
-    data,
-    geoViewerRef,
-    imageCursorRef,
+    aggregateController,
+    containers,
+    state,
+    geoViewers,
+    imageCursors,
     initialize,
     onResize,
-    resetMapDimensions,
+    clear,
+    setAlignedFrameResolver,
+    setResetZoomOverride,
   };
 }

@@ -13,6 +13,10 @@ The [Training Data Collection](https://viame.kitware.com/#/collection/5e4c256ca0
 
 This use case is covered [on the sharing page](Web-Version.md#sharing-data-with-teams).
 
+## Where do I find data someone shared with me?
+
+Use the **Shared With Me** tab in the data browser. See [Data Shared with you](Web-Version.md#data-shared-with-you) for what appears there. That tab only lists **private** data shared with you directly; public datasets from other users are opened from **Browse Data** or a link, not from Shared With Me.
+
 If you want to **publish** your data so that other groups can use it, please [contact us](Support.md).
 
 ## How do I run analysis workflows on my data?
@@ -34,6 +38,10 @@ Training configurations are listed [on the pipeline page](Pipeline-Documentation
 If you have data in lots of places or it arrives at different times, it's probably best to break these batches or groups into individual datasets and annotate each individually.  Using the checkboxes in web, you can use multiple datasets to generate a trained model.
 
 Breaking large amounts of data up into manageable groups is generally a good idea.
+
+## Is it possible to get email notifications when a job is done?
+
+DIVE Web doesn't currently support notifications through email for job status changes.  You can check your job status through the web interface.
 
 ## Do users need to transcode their own data?
 
@@ -66,3 +74,7 @@ There are caveats with this approach.
 
 * It does not handle padding properly.  If a video begins or ends with padding, you may see a black screen in DIVE, but kwiver will wait for the first true frame to use as the representative for the bucket.
 * It does not handle variable width frames properly.  If a video has variable width frames, the assumptions about the locations of true frame boundaries do not hold and kwiver training may have alignment issues.
+
+## Does DIVE support interactive segmentation or stereo while annotating?
+
+Yes, on **[DIVE Desktop](Dive-Desktop.md)** only. Interactive point-click segmentation and interactive stereo (auto-warp between cameras, length recompute) require a local VIAME install with interactive service support. See [Interactive Annotation](Interactive-Annotation.md).

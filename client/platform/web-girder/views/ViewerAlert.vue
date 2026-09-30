@@ -1,12 +1,12 @@
 <script lang="ts">
-import { defineComponent, ref, toRef } from '@vue/composition-api';
+import { useBrand } from 'platform/web-girder/store/useBrand';
+import { defineComponent, ref } from 'vue';
 
 export default defineComponent({
   name: 'ViewerAlert',
-  setup(_, { root }) {
+  setup() {
+    const { brandData } = useBrand();
     const dialog = ref(false);
-
-    const brandData = toRef(root.$store.state.Brand, 'brandData');
 
     return {
       dialog,
@@ -23,7 +23,7 @@ export default defineComponent({
     max-width="600px"
     overlay-opacity="0.90"
   >
-    <template v-slot:activator="{ on, attrs }">
+    <template #activator="{ on, attrs }">
       <v-btn
         icon
         dark

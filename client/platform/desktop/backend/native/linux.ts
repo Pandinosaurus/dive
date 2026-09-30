@@ -13,13 +13,11 @@ import {
   NvidiaSmiReply,
   RunTraining,
   DesktopJobUpdater,
-  ConversionArgs,
-  CheckMediaResults,
+  ExportTrainedPipeline,
+  RunScoring,
 } from 'platform/desktop/constants';
 import { observeChild } from 'platform/desktop/backend/native/processManager';
 import * as viame from './viame';
-import * as mediaJobs from './mediaJobs';
-import { spawnResult } from './utils';
 
 const DefaultSettings: Settings = {
   // The current settings schema config
@@ -43,44 +41,39 @@ const DefaultSettings: Settings = {
 
 const ViameLinuxConstants = {
   setup: 'setup_viame.sh',
-  trainingExe: 'viame_train_detector',
-  kwiverExe: 'kwiver',
+  viameExe: 'viame',
   shell: '/bin/bash',
-  ffmpeg: {
-    // Ready indicates that the proper ffmpeg settings have been learned from the system.
-    ready: false,
-    initialization: '', // command to initialize
-    path: '', // location of the ffmpeg executable
-    // Default video args
-    videoArgs: [
-      '-c:v libx264',
-      '-preset slow',
-      // https://github.com/Kitware/dive/issues/855
-      '-crf 22',
-      // https://askubuntu.com/questions/1315697/could-not-find-tag-for-codec-pcm-s16le-in-stream-1-codec-not-currently-support
-      '-c:a aac',
-      /**
-       * TODO: Upgrade to ffmpeg 4, use `round` instead of `ceil`
-       * 3.4 is part of 18.04LTS, so we should support it
-       *
-       * References:
-       * https://github.com/Kitware/dive/pull/602 (Anamorphic Video Support)
-       * https://video.stackexchange.com/questions/20871/how-do-i-convert-anamorphic-hdv-video-to-normal-h-264-video-with-ffmpeg-how-to
-       */
-      '-vf "scale=ceil(iw*sar/2)*2:ceil(ih/2)*2,setsar=1"',
-    ].join(' '),
-  },
 };
-
-const ViameBundledFFMPEGVideoArgs = [
-  '-c:v h264',
-  '-c: a copy',
-  '-vf "scale=ceil(iw*sar/2)*2:ceil(ih/2)*2,setsar=1"',
-].join(' ');
 
 function sourceString(settings: Settings) {
   const setupScriptAbs = npath.join(settings.viamePath, ViameLinuxConstants.setup);
-  return `. "${setupScriptAbs}"`;
+  // Clear inherited VIAME paths so setup_viame.sh defines a consistent environment.
+  const clearEnv = [
+    'KWIVER_PLUGIN_PATH',
+    'SPROKIT_PYTHON_MODULES',
+    'PYTHONPATH',
+    'VIAME_INSTALL',
+    'SPROKIT_MODULE_PATH',
+  ].join(' ');
+  return `unset ${clearEnv} && . "${setupScriptAbs}"`;
+}
+
+function getViameConstants(settings: Settings): viame.ViameConstants {
+  return {
+    ...ViameLinuxConstants,
+    setupScriptAbs: sourceString(settings),
+  };
+}
+
+function getViamePythonExe(settings: Settings): string {
+  // Packaged binary installs bundle an interpreter at bin/python. From-source
+  // builds against system python have no such interpreter and instead rely on
+  // setup_viame.sh putting the correct python on PATH, so fall back to that.
+  const bundled = npath.join(settings.viamePath, 'bin', 'python');
+  if (fs.existsSync(bundled)) {
+    return bundled;
+  }
+  return 'python';
 }
 
 async function validateViamePath(settings: Settings): Promise<true | string> {
@@ -90,22 +83,22 @@ async function validateViamePath(settings: Settings): Promise<true | string> {
     return `${setupScriptPath} does not exist`;
   }
 
-  const trainingScriptPath = npath.join(settings.viamePath, 'bin', ViameLinuxConstants.trainingExe);
-  const trainingExists = await fs.pathExists(trainingScriptPath);
-  if (!trainingExists) {
-    return `${trainingScriptPath} does not exist`;
+  const viameExePath = npath.join(settings.viamePath, 'bin', ViameLinuxConstants.viameExe);
+  const viameExists = await fs.pathExists(viameExePath);
+  if (!viameExists) {
+    return `${viameExePath} does not exist`;
   }
 
-  const kwiverExistsOnPath = observeChild(spawn(
-    `${sourceString(settings)} && which ${ViameLinuxConstants.kwiverExe}`,
+  const viameOnPath = observeChild(spawn(
+    `${sourceString(settings)} && which ${ViameLinuxConstants.viameExe}`,
     { shell: '/bin/bash' },
   ));
   return new Promise((resolve) => {
-    kwiverExistsOnPath.on('exit', (code) => {
+    viameOnPath.on('exit', (code) => {
       if (code === 0) {
         resolve(true);
       } else {
-        resolve('kwiver failed to initialize');
+        resolve('viame failed to initialize');
       }
     });
   });
@@ -116,10 +109,21 @@ async function runPipeline(
   runPipelineArgs: RunPipeline,
   updater: DesktopJobUpdater,
 ): Promise<DesktopJob> {
-  return viame.runPipeline(settings, runPipelineArgs, updater, validateViamePath, {
-    ...ViameLinuxConstants,
-    setupScriptAbs: sourceString(settings),
-  });
+  return viame.runPipeline(settings, runPipelineArgs, updater, validateViamePath, getViameConstants(settings));
+}
+
+async function exportTrainedPipeline(
+  settings: Settings,
+  exportTrainedPipelineArgs: ExportTrainedPipeline,
+  updater: DesktopJobUpdater,
+): Promise<DesktopJob> {
+  return viame.exportTrainedPipeline(
+    settings,
+    exportTrainedPipelineArgs,
+    updater,
+    validateViamePath,
+    getViameConstants(settings),
+  );
 }
 
 async function train(
@@ -127,10 +131,15 @@ async function train(
   runTrainingArgs: RunTraining,
   updater: DesktopJobUpdater,
 ): Promise<DesktopJob> {
-  return viame.train(settings, runTrainingArgs, updater, validateViamePath, {
-    ...ViameLinuxConstants,
-    setupScriptAbs: sourceString(settings),
-  });
+  return viame.train(settings, runTrainingArgs, updater, validateViamePath, getViameConstants(settings));
+}
+
+async function runScoring(
+  settings: Settings,
+  runScoringArgs: RunScoring,
+  updater: DesktopJobUpdater,
+): Promise<DesktopJob> {
+  return viame.runScoring(settings, runScoringArgs, updater, validateViamePath, getViameConstants(settings));
 }
 
 // Based on https://github.com/chrisallenlane/node-nvidia-smi
@@ -162,91 +171,14 @@ async function nvidiaSmi(): Promise<NvidiaSmiReply> {
   });
 }
 
-/**
- * one time per launch configuration for ffmpeg and ffprobe
- * Linux version is more complicated for multiple VIAME versions and local ffmpeg
- */
-async function ffmpegCommand(settings: Settings) {
-  if (ViameLinuxConstants.ffmpeg.ready) {
-    return;
-  }
-  const ffmpegPathViame = `${settings.viamePath}/bin/ffmpeg`;
-  const init = `${sourceString(settings)} &&`;
-  const errorLog = [];
-  //First lets see if the VIAME install has libx264
-  const ffmpegViameExists = fs.existsSync(`${settings.viamePath}/bin/ffmpeg`);
-  if (ffmpegViameExists) {
-    const viameffmpeg = await spawnResult(`${init} "${ffmpegPathViame}" -encoders`, '/bin/bash');
-    if (viameffmpeg.output) {
-      if (viameffmpeg.output.includes('libx264')) {
-        ViameLinuxConstants.ffmpeg.initialization = init;
-        ViameLinuxConstants.ffmpeg.path = ffmpegPathViame;
-        ViameLinuxConstants.ffmpeg.ready = true;
-        return;
-      }
-    }
-    if (viameffmpeg.exitCode === -1) {
-      errorLog.push(viameffmpeg.error);
-    }
-  }
-  //Now we need to test for a local install with libx264
-  const localffmpeg = await spawnResult('ffmpeg -encoders', '/bin/bash');
-  if (localffmpeg.output) {
-    if (localffmpeg.output.includes('libx264')) {
-      ViameLinuxConstants.ffmpeg.initialization = '';
-      ViameLinuxConstants.ffmpeg.path = 'ffmpeg';
-      ViameLinuxConstants.ffmpeg.ready = true;
-      return;
-    }
-  }
-  if (localffmpeg.exitCode === -1) {
-    errorLog.push(localffmpeg.error);
-  }
-
-  // As long as VIAMEffmpeg exists we can attempt to use nvida encoding
-  if (ffmpegViameExists) {
-    ViameLinuxConstants.ffmpeg.initialization = init;
-    ViameLinuxConstants.ffmpeg.path = ffmpegPathViame;
-    ViameLinuxConstants.ffmpeg.videoArgs = ViameBundledFFMPEGVideoArgs;
-    ViameLinuxConstants.ffmpeg.ready = true;
-    return;
-  }
-  //We make it down here we have no way to convert the video file
-  if (errorLog.length) {
-    throw new Error(`ffmpeg errors: ${errorLog.join(' | ')}`);
-  }
-  throw new Error('ffmpeg not installed, please download and install VIAME Toolkit from the main page');
-}
-
-/**
- * Checs the video file for the codec type and
- * returns true if it is x264, if not will return false for media conversion
- */
-async function checkMedia(settings: Settings, file: string): Promise<CheckMediaResults> {
-  await ffmpegCommand(settings);
-  return mediaJobs.checkMedia({
-    ...ViameLinuxConstants,
-    setupScriptAbs: sourceString(settings),
-  }, file);
-}
-
-async function convertMedia(settings: Settings,
-  args: ConversionArgs,
-  updater: DesktopJobUpdater): Promise<DesktopJob> {
-  await ffmpegCommand(settings);
-  return mediaJobs.convertMedia(settings, args, updater, {
-    ...ViameLinuxConstants,
-    setupScriptAbs: sourceString(settings),
-  });
-}
-
-
 export default {
   DefaultSettings,
   nvidiaSmi,
-  checkMedia,
-  convertMedia,
   runPipeline,
+  exportTrainedPipeline,
   train,
+  runScoring,
   validateViamePath,
+  getViameConstants,
+  getViamePythonExe,
 };

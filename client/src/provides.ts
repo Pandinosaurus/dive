@@ -1,17 +1,31 @@
-import IntervalTree from '@flatten-js/interval-tree';
 import {
-  provide, inject, ref, Ref,
-} from '@vue/composition-api';
+  provide, inject, ref, Ref, reactive,
+} from 'vue';
 
-import { AnnotatorPreferences as AnnotatorPrefsIface } from './types';
-import { CustomStyle, StateStyles, TypeStyling } from './use/useStyling';
-import { EditAnnotationTypes } from './layers/EditAnnotationLayer';
-import Track, { TrackId } from './track';
-import { VisibleAnnotationTypes } from './layers';
-import { RectBounds } from './utils';
-import { Attribute } from './use/useAttributes';
-import { DefaultConfidence, TrackWithContext } from './use/useTrackFilters';
-import { Time } from './use/useTimeObserver';
+import type { AnnotatorPreferences as AnnotatorPrefsIface } from './types';
+import StyleManager from './StyleManager';
+import type { EditAnnotationTypes } from './layers/EditAnnotationLayer';
+import type { AnnotationId, StringKeyObject } from './BaseAnnotation';
+import type { VisibleAnnotationTypes } from './layers';
+import type { RectBounds } from './utils';
+import type { TrackSupportedFeature } from './track';
+import type {
+  Attribute,
+  AttributeFilter,
+  AttributeKeyFilter,
+  TimelineAttribute,
+} from './use/AttributeTypes';
+import type { Time } from './use/useTimeObserver';
+import type {
+  ImageEnhancements,
+  PercentileHistogram,
+  PercentileStretch,
+} from './use/useImageEnhancements';
+import TrackFilterControls from './TrackFilterControls';
+import GroupFilterControls from './GroupFilterControls';
+import CameraStore from './CameraStore';
+import CameraRegistrationStore from './alignedView/CameraRegistrationStore';
+import AlignedViewStore from './alignedView/AlignedViewStore';
 
 /**
  * Type definitions are read only because injectors may mutate internal state,
@@ -24,56 +38,72 @@ type AnnotatorPreferences = Readonly<Ref<AnnotatorPrefsIface>>;
 const AttributesSymbol = Symbol('attributes');
 type AttributesType = Readonly<Ref<Attribute[]>>;
 
-const AllTypesSymbol = Symbol('allTypes');
-type AllTypesType = Readonly<Ref<readonly string[]>>;
+const AttributesFilterSymbol = Symbol('attributesFilter');
+export interface AttributesFilterType {
+  attributeFilters: Readonly<Ref< {track: AttributeFilter[]; detection: AttributeFilter[]}>>;
+  addAttributeFilter: (index: number, type: Attribute['belongs'], filter: AttributeFilter) => void;
+  modifyAttributeFilter: (index: number, type: Attribute['belongs'], filter: AttributeFilter) => void;
+  deleteAttributeFilter: (index: number, type: Attribute['belongs']) => void;
+  sortAndFilterAttributes: (attributeList: Attribute[], mode: Attribute['belongs'], attribVals: StringKeyObject, sortingMode: number, filters: AttributeFilter[]) => Attribute[];
+  setTimelineEnabled: (val: boolean) => void;
+  setTimelineFilter: (filter: AttributeKeyFilter) => void;
+  attributeTimelineData: Readonly<Ref<TimelineAttribute[]>>;
+  timelineFilter: Readonly<Ref<AttributeKeyFilter>>;
+  timelineEnabled: Readonly<Ref<boolean>>;
+}
 
 const DatasetIdSymbol = Symbol('datasetID');
 type DatasetIdType = Readonly<Ref<string>>;
 
-const UsedTypesSymbol = Symbol('usedTypes');
-type UsedTypesType = Readonly<Ref<readonly string[]>>;
-
-const CheckedTrackIdsSymbol = Symbol('checkedTrackIds');
-type CheckedTrackIdsType = Readonly<Ref<readonly TrackId[]>>;
-
-const CheckedTypesSymbol = Symbol('checkedTypes');
-type CheckedTypesType = Readonly<Ref<readonly string[]>>;
-
-const ConfidenceFiltersSymbol = Symbol('confidenceFilters');
-type ConfidenceFiltersType = Readonly<Ref<Readonly<Record<string, number>>>>;
-
-const EnabledTracksSymbol = Symbol('enabledTracks');
-type EnabledTracksType = Readonly<Ref<readonly TrackWithContext[]>>;
-
 const EditingModeSymbol = Symbol('editingMode');
 type EditingModeType = Readonly<Ref<false | EditAnnotationTypes>>;
 
-const MergeListSymbol = Symbol('mergeList');
-type MergeList = Readonly<Ref<readonly TrackId[]>>;
+const MultiSelectSymbol = Symbol('multiSelect');
+type MultiSelectType = Readonly<Ref<readonly AnnotationId[]>>;
+
+const SegmentationPointsSymbol = Symbol('segmentationPoints');
+type SegmentationPointsType = Readonly<Ref<{ points: [number, number][]; labels: number[]; frameNum: number }>>;
+
+const SegmentationCursorLoadingSymbol = Symbol('segmentationCursorLoading');
+type SegmentationCursorLoadingType = Readonly<Ref<boolean>>;
 
 const PendingSaveCountSymbol = Symbol('pendingSaveCount');
 type pendingSaveCountType = Readonly<Ref<number>>;
 
-const IntervalTreeSymbol = Symbol('intervalTree');
-type IntervalTreeType = Readonly<IntervalTree>;
+const ProgressSymbol = Symbol('progress');
+type ProgressType = Readonly<{ loaded: boolean }>;
 
-const TrackMapSymbol = Symbol('trackMap');
-type TrackMapType = Readonly<Map<TrackId, Track>>;
+const RevisionIdSymbol = Symbol('revisionId');
+type RevisionIdType = Readonly<Ref<number>>;
 
-const TracksSymbol = Symbol('tracks');
-type FilteredTracksType = Readonly<Ref<readonly TrackWithContext[]>>;
+const AnnotationSetSymbol = Symbol('annotationSet');
+type AnnotationSetType = Readonly<Ref<string>>;
 
-const TypeStylingSymbol = Symbol('typeStyling');
-type TypeStylingType = Readonly<Ref<TypeStyling>>;
+const AnnotationSetsSymbol = Symbol('annotationSets');
+type AnnotationSetsType = Readonly<Ref<string[]>>;
+
+const ComparisonSetsSymbol = Symbol('comparisonSets');
+type ComparisonSetsType = Readonly<Ref<string[]>>;
+
+const SelectedCameraSymbol = Symbol('selectedCamera');
+type SelectedCameraType = Readonly<Ref<string>>;
 
 const SelectedKeySymbol = Symbol('selectedKey');
 type SelectedKeyType = Readonly<Ref<string>>;
 
 const SelectedTrackIdSymbol = Symbol('selectedTrackId');
-type SelectedTrackIdType = Readonly<Ref<TrackId | null>>;
+const EditingGroupIdSymbol = Symbol('editingGroupId');
+type SelectedTrackIdType = Readonly<Ref<AnnotationId | null>>;
 
-const StateStylesSymbol = Symbol('stateStyles');
-type StateStylesType = Readonly<StateStyles>;
+const EditingMultiTrackSymbol = Symbol('editingMultiTrack');
+type EditingMultiTrackType = Readonly<Ref<boolean>>;
+
+const LassoModeSymbol = Symbol('lassoMode');
+export interface LassoModeContext {
+  lassoModeActive: Readonly<Ref<boolean>>;
+  lassoDrawing: Readonly<Ref<boolean>>;
+  setLassoDrawing: (drawing: boolean) => void;
+}
 
 const TimeSymbol = Symbol('time');
 type TimeType = Readonly<Time>;
@@ -81,34 +111,70 @@ type TimeType = Readonly<Time>;
 const VisibleModesSymbol = Symbol('visibleModes');
 type VisibleModesType = Readonly<Ref<readonly VisibleAnnotationTypes[]>>;
 
+const ReadOnlyModeSymbol = Symbol('readOnlyMode');
+type ReadOnylModeType = Readonly<Ref<boolean>>;
+
+const ImageEnhancementsSymbol = Symbol('imageEnhancements');
+type ImageEnhancementsType = Readonly<Ref<ImageEnhancements>>;
+
+const PercentileStretchSupportedSymbol = Symbol('percentileStretchSupported');
+type PercentileStretchSupportedType = Readonly<Ref<boolean>>;
+const PercentileHistogramSymbol = Symbol('percentileHistogram');
+type PercentileHistogramType = Readonly<Ref<PercentileHistogram | null>>;
+const PercentileHistogramLoadingSymbol = Symbol('percentileHistogramLoading');
+type PercentileHistogramLoadingType = Readonly<Ref<boolean>>;
+
+/** Class-based symbols */
+const CameraStoreSymbol = Symbol('cameraStore');
+const CameraRegistrationSymbol = Symbol('cameraRegistration');
+const AlignedViewSymbol = Symbol('alignedView');
+
+const TrackStyleManagerSymbol = Symbol('trackTypeStyling');
+const GroupStyleManagerSymbol = Symbol('groupTypeStyling');
+
+const TrackFilterControlsSymbol = Symbol('trackFilters');
+const GroupFilterControlsSymbol = Symbol('groupFilters');
+
 /**
  * Handler interface describes all global events mutations
  * for above state
  */
 export interface Handler {
   /* Save pending changes to persistence layer */
-  save(): Promise<void>;
+  save(set?: string): Promise<void>;
   /* Select and seek to track */
-  trackSeek(trackId: TrackId): void;
+  trackSeek(AnnotationId: AnnotationId, modifiers?: { ctrl: boolean }): void;
+  /* Seek Frame */
+  seekFrame(frame: number): void;
   /* Toggle editing mode for track */
-  trackEdit(trackId: TrackId): void;
-  /* set checked track ids */
-  trackEnable(trackId: TrackId, value: boolean): void;
+  trackEdit(AnnotationId: AnnotationId): void;
+  /* Confirm/lock the current annotation for active recipes */
+  confirmRecipe(): void;
+  /* Finalize pending segmentation without deselecting (cross-camera handoff) */
+  segmentationFinalizePending(): void;
   /* toggle selection mode for track */
-  trackSelect(trackId: TrackId | null, edit: boolean): void;
+  trackSelect(AnnotationId: AnnotationId | null, edit: boolean, modifiers?: { ctrl: boolean }): void;
+  /* select tracks enclosed by a lasso polygon */
+  lassoSelect(trackIds: AnnotationId[], modifiers?: { ctrl: boolean }): void;
   /* select next track in the list */
-  trackSelectNext(delta: number): void;
+  trackSelectNext(delta: number, filteredOverride?: readonly { id: AnnotationId }[]): void;
   /* split track */
-  trackSplit(trackId: TrackId | null, frame: number): void;
-  /* Change tracks difinitive type */
-  trackTypeChange(trackId: TrackId | null, value: string): void;
+  trackSplit(AnnotationId: AnnotationId | null, frame: number): void;
   /* Add new empty track and select it */
-  trackAdd(): TrackId;
+  trackAdd(): AnnotationId;
   /* update Rectangle bounds for track */
   updateRectBounds(
     frameNum: number,
     flickNum: number,
     bounds: RectBounds,
+    rotation?: number,
+  ): void;
+  /* Set a feature on the selected track with proper interpolation handling */
+  setTrackFeature(
+    frameNum: number,
+    bounds: RectBounds,
+    geometry: GeoJSON.Feature<TrackSupportedFeature>[],
+    runAfterLogic?: boolean,
   ): void;
   /* update geojson for track */
   updateGeoJSON(
@@ -120,44 +186,64 @@ export interface Handler {
     preventInterrupt?: () => void,
   ): void;
   /* Remove a whole track */
-  removeTrack(trackIds: TrackId[], forcePromptDisable?: boolean): void;
+  removeTrack(AnnotationIds: AnnotationId[],
+    forcePromptDisable?: boolean, cameraName?: string): void;
+  /* remove a whole group */
+  removeGroup(AnnotationIds: AnnotationId[]): void;
   /* Remove a single point from selected track's geometry by selected index */
   removePoint(): void;
   /* Remove an entire annotation from selected track by selected key */
   removeAnnotation(): void;
+  /* selectCamera */
+  selectCamera(camera: string, editMode: boolean, preserveSelection?: boolean): void;
   /* set selectFeatureHandle and selectedKey */
   selectFeatureHandle(i: number, key: string): void;
-  /* set checked type strings */
-  setCheckedTypes(types: string[]): void;
-  /* set checked type strings */
-  removeTypeTracks(types: string[]): void;
-  /* removes an individual type */
-  deleteType(types: string): void;
-  /* Change type name */
-  updateTypeName({ currentType, newType }: { currentType: string; newType: string }): void;
-  /* change styles */
-  updateTypeStyle(args: {
-    type: string;
-    value: CustomStyle;
-  }): void;
   /* set an Attribute in the metaData */
   setAttribute({ data, oldAttribute }:
     { data: Attribute; oldAttribute?: Attribute }, updateAllTracks?: boolean): void;
-  /* set confidence thresholds  */
-  setConfidenceFilters(val: Record<string, number>): void;
   /* delete an Attribute in the metaData */
   deleteAttribute({ data }: { data: Attribute }, removeFromTracks?: boolean): void;
   /* Commit the staged merge tracks */
   commitMerge(): void;
+  /* Create new group */
+  groupAdd(): void;
+  /* Delete all selected tracks */
+  deleteSelectedTracks(): void;
+  /* Put UI into group editing mode */
+  groupEdit(id: AnnotationId | null): void;
   /* Turn merge mode on and off */
-  toggleMerge(): TrackId[];
-  /* Remove trackIds from merge */
-  unstageFromMerge(ids: TrackId[]): void;
+  toggleMerge(): AnnotationId[];
+  /* Remove AnnotationIds from merge */
+  unstageFromMerge(ids: AnnotationId[]): void;
   /* Reload Annotation File */
   reloadAnnotations(): Promise<void>;
+  setSVGFilters({
+    brightness, contrast, saturation, sharpen, percentileStretch,
+  }: {
+    brightness?: number;
+    contrast?: number;
+    saturation?: number;
+    sharpen?: number;
+    percentileStretch?: PercentileStretch | null;
+  }): void;
+  /* unlink Camera Track */
+  unlinkCameraTrack(trackId: AnnotationId, camera: string): void;
+  /* link Camera Track */
+  linkCameraTrack(baseTrackId: AnnotationId, linkTrackId: AnnotationId, camera: string): void;
+  startLinking(camera: string): void;
+  stopLinking(): void;
+  setChange(set: string): void;
+  /* Add a hole to the current polygon */
+  addHole(): void;
+  /* Add a new separate polygon */
+  addPolygon(): void;
+  /* Cancel any in-progress creation mode (hole or polygon addition) */
+  cancelCreation(): void;
+  /* Register callback to finalize in-progress shapes (used by LayerManager) */
+  registerFinalizeCreation(cb: () => void): void;
+
 }
 const HandlerSymbol = Symbol('handler');
-
 
 /**
  * Make a trivial noop handler. Useful if you only intend to
@@ -168,31 +254,43 @@ function dummyHandler(handle: (name: string, args: unknown[]) => void): Handler 
   return {
     save(...args) { handle('save', args); return Promise.resolve(); },
     trackSeek(...args) { handle('trackSeek', args); },
+    seekFrame(...args) { handle('seekFrame', args); },
     trackEdit(...args) { handle('trackEdit', args); },
-    trackEnable(...args) { handle('trackEnable', args); },
+    confirmRecipe(...args) { handle('confirmRecipe', args); },
+    segmentationFinalizePending(...args) { handle('segmentationFinalizePending', args); },
     trackSelect(...args) { handle('trackSelect', args); },
+    lassoSelect(...args) { handle('lassoSelect', args); },
     trackSelectNext(...args) { handle('trackSelectNext', args); },
     trackSplit(...args) { handle('trackSplit', args); },
-    trackTypeChange(...args) { handle('trackTypeChange', args); },
     trackAdd(...args) { handle('trackAdd', args); return 0; },
     updateRectBounds(...args) { handle('updateRectBounds', args); },
+    setTrackFeature(...args) { handle('setTrackFeature', args); },
     updateGeoJSON(...args) { handle('updateGeoJSON', args); },
     removeTrack(...args) { handle('removeTrack', args); },
+    removeGroup(...args) { handle('removeGroup', args); },
     removePoint(...args) { handle('removePoint', args); },
     removeAnnotation(...args) { handle('removeAnnotation', args); },
+    selectCamera(...args) { handle('selectCamera', args); },
     selectFeatureHandle(...args) { handle('selectFeatureHandle', args); },
-    setCheckedTypes(...args) { handle('setCheckedTypes', args); },
-    removeTypeTracks(...args) { handle('removeTypeTracks', args); },
-    deleteType(...args) { handle('deleteType', args); },
-    updateTypeName(...args) { handle('updateTypeName', args); },
-    updateTypeStyle(...args) { handle('updateTypeStyle', args); },
     setAttribute(...args) { handle('setAttribute', args); },
-    setConfidenceFilters(...args) { handle('setConfidenceFilters', args); },
     deleteAttribute(...args) { handle('deleteAttribute', args); },
     toggleMerge(...args) { handle('toggleMerge', args); return []; },
     commitMerge(...args) { handle('commitMerge', args); },
+    groupAdd(...args) { handle('groupAdd', args); },
+    deleteSelectedTracks(...args) { handle('deleteSelectedTracks', args); },
+    groupEdit(...args) { handle('groupEdit', args); },
     unstageFromMerge(...args) { handle('unstageFromMerge', args); },
     reloadAnnotations(...args) { handle('reloadTracks', args); return Promise.resolve(); },
+    setSVGFilters(...args) { handle('setSVGFilter', args); },
+    unlinkCameraTrack(...args) { handle('unlinkCameraTrack', args); },
+    linkCameraTrack(...args) { handle('linkCameraTrack', args); },
+    startLinking(...args) { handle('startLinking', args); },
+    stopLinking(...args) { handle('stopLinking', args); },
+    setChange(...args) { handle('setChange', args); },
+    addHole(...args) { handle('addHole', args); },
+    addPolygon(...args) { handle('addPolygon', args); },
+    cancelCreation(...args) { handle('cancelCreation', args); },
+    registerFinalizeCreation(...args) { handle('registerFinalizeCreation', args); },
   };
 }
 
@@ -206,79 +304,122 @@ function dummyHandler(handle: (name: string, args: unknown[]) => void): Handler 
 export interface State {
   annotatorPreferences: AnnotatorPreferences;
   attributes: AttributesType;
-  allTypes: AllTypesType;
+  cameraStore: CameraStore;
+  cameraRegistration: CameraRegistrationStore;
+  alignedView: AlignedViewStore;
   datasetId: DatasetIdType;
-  usedTypes: UsedTypesType;
-  checkedTrackIds: CheckedTrackIdsType;
-  checkedTypes: CheckedTypesType;
-  confidenceFilters: ConfidenceFiltersType;
   editingMode: EditingModeType;
-  enabledTracks: EnabledTracksType;
-  filteredTracks: FilteredTracksType;
-  intervalTree: IntervalTreeType;
-  mergeList: MergeList;
+  groupFilters: GroupFilterControls;
+  groupStyleManager: StyleManager;
+  multiSelectList: MultiSelectType;
   pendingSaveCount: pendingSaveCountType;
-  trackMap: TrackMapType;
-  typeStyling: TypeStylingType;
+  progress: ProgressType;
+  revisionId: RevisionIdType;
+  annotationSet: AnnotationSetType;
+  annotationSets: AnnotationSetsType;
+  comparisonSets: ComparisonSetsType;
+  segmentationPoints: SegmentationPointsType;
+  segmentationCursorLoading: SegmentationCursorLoadingType;
+  selectedCamera: SelectedCameraType;
   selectedKey: SelectedKeyType;
   selectedTrackId: SelectedTrackIdType;
-  stateStyles: StateStylesType;
+  editingGroupId: SelectedTrackIdType;
+  editingMultiTrack: EditingMultiTrackType;
   time: TimeType;
+  trackFilters: TrackFilterControls;
+  trackStyleManager: StyleManager;
   visibleModes: VisibleModesType;
+  readOnlyMode: ReadOnylModeType;
+  imageEnhancements: ImageEnhancementsType;
+  percentileStretchSupported: Readonly<Ref<boolean>>;
+  percentileHistogram: PercentileHistogramType;
+  percentileHistogramLoading: PercentileHistogramLoadingType;
 }
+
+const markChangesPending = () => { };
 
 /**
  * make a trivial state store. Useful if you only
  * intend to override some small number of values.
  */
 function dummyState(): State {
-  const style = {
-    strokeWidth: 2,
-    opacity: 1,
-    color: 'white',
-    fill: false,
-    showLabel: true,
-    showConfidence: true,
+  const cameraStore = new CameraStore({ markChangesPending });
+  const removeTypes = (id: AnnotationId, types: string[]) => cameraStore.removeTypes(id, types);
+  const setGroupType = (
+    id: AnnotationId,
+    newType: string,
+    confidenceVal?: number,
+    currentType?: string,
+  ) => {
+    cameraStore.setGroupType(id, newType, confidenceVal, currentType);
   };
+  const removeGroupTypes = (id: AnnotationId, types: string[]) => cameraStore.removeGroupTypes(id, types);
+  const groupFilterControls = new GroupFilterControls(
+    {
+      sorted: cameraStore.sortedGroups,
+      remove: cameraStore.removeGroups,
+      markChangesPending,
+      setGroupType,
+      removeTypes: removeGroupTypes,
+    },
+  );
+  const trackFilterControls = new TrackFilterControls({
+    sorted: cameraStore.sortedTracks,
+    remove: cameraStore.removeTracks,
+    markChangesPending,
+    groupFilterControls,
+    lookupGroups: cameraStore.lookupGroups.bind(cameraStore),
+    getTracks: (track: AnnotationId) => cameraStore.getTrackAll(track),
+    renameTrackPair: (id, currentType, newType) => (
+      cameraStore.renameTrackPair(id, currentType, newType)
+    ),
+    removeTypes,
+
+  });
   return {
-    annotatorPreferences: ref({ trackTails: { before: 20, after: 10 } }),
+    annotatorPreferences: ref({ trackTails: { before: 20, after: 10 }, lockedCamera: { enabled: false } }),
     attributes: ref([]),
-    allTypes: ref([]),
+    cameraStore,
+    cameraRegistration: new CameraRegistrationStore(),
+    alignedView: new AlignedViewStore(),
     datasetId: ref(''),
-    usedTypes: ref([]),
-    checkedTrackIds: ref([]),
-    checkedTypes: ref([]),
-    confidenceFilters: ref({ default: DefaultConfidence }),
     editingMode: ref(false),
-    enabledTracks: ref([]),
-    filteredTracks: ref([]),
-    intervalTree: new IntervalTree(),
-    mergeList: ref([]),
+    multiSelectList: ref([]),
     pendingSaveCount: ref(0),
-    trackMap: new Map<TrackId, Track>(),
-    typeStyling: ref({
-      color() { return style.color; },
-      strokeWidth() { return style.strokeWidth; },
-      opacity() { return style.opacity; },
-      fill() { return style.fill; },
-      labelSettings() {
-        return { showLabel: style.showLabel, showConfidence: style.showConfidence };
-      },
-    }),
+    progress: reactive({ loaded: true }),
+    revisionId: ref(0),
+    annotationSet: ref(''),
+    annotationSets: ref([]),
+    comparisonSets: ref([]),
+    groupFilters: groupFilterControls,
+    groupStyleManager: new StyleManager({ markChangesPending }),
+    segmentationPoints: ref({ points: [], labels: [], frameNum: -1 }),
+    segmentationCursorLoading: ref(false),
+    selectedCamera: ref('singleCam'),
     selectedKey: ref(''),
     selectedTrackId: ref(null),
-    stateStyles: {
-      disabled: style,
-      selected: style,
-      standard: style,
-    },
+    editingGroupId: ref(null),
+    editingMultiTrack: ref(false),
     time: {
       frame: ref(0),
       flick: ref(0),
       frameRate: ref(0),
       originalFps: ref(null),
+      isPlaying: ref(false),
     },
+    trackFilters: trackFilterControls,
+    trackStyleManager: new StyleManager({ markChangesPending }),
     visibleModes: ref(['rectangle', 'text'] as VisibleAnnotationTypes[]),
+    readOnlyMode: ref(false),
+    imageEnhancements: ref({
+      brightness: 1,
+      contrast: 1,
+      saturation: 1,
+      sharpen: 0,
+    }),
+    percentileStretchSupported: ref(false),
+    percentileHistogram: ref(null),
+    percentileHistogramLoading: ref(false),
   };
 }
 
@@ -288,31 +429,44 @@ function dummyState(): State {
  * are currently not supported.
  *
  * @param {State} state
- * @param {Hander} handler
+ * @param {Handler} handler
+ * @param {}
  */
-function provideAnnotator(state: State, handler: Handler) {
+function provideAnnotator(state: State, handler: Handler, attributesFilters: AttributesFilterType) {
   provide(AnnotatorPreferencesSymbol, state.annotatorPreferences);
   provide(AttributesSymbol, state.attributes);
-  provide(AllTypesSymbol, state.allTypes);
+  provide(CameraStoreSymbol, state.cameraStore);
+  provide(CameraRegistrationSymbol, state.cameraRegistration);
+  provide(AlignedViewSymbol, state.alignedView);
   provide(DatasetIdSymbol, state.datasetId);
-  provide(UsedTypesSymbol, state.usedTypes);
-  provide(CheckedTrackIdsSymbol, state.checkedTrackIds);
-  provide(CheckedTypesSymbol, state.checkedTypes);
-  provide(ConfidenceFiltersSymbol, state.confidenceFilters);
-  provide(EnabledTracksSymbol, state.enabledTracks);
   provide(EditingModeSymbol, state.editingMode);
-  provide(IntervalTreeSymbol, state.intervalTree);
-  provide(MergeListSymbol, state.mergeList);
+  provide(GroupFilterControlsSymbol, state.groupFilters);
+  provide(GroupStyleManagerSymbol, state.groupStyleManager);
+  provide(MultiSelectSymbol, state.multiSelectList);
   provide(PendingSaveCountSymbol, state.pendingSaveCount);
-  provide(TrackMapSymbol, state.trackMap);
-  provide(TracksSymbol, state.filteredTracks);
-  provide(TypeStylingSymbol, state.typeStyling);
+  provide(ProgressSymbol, state.progress);
+  provide(RevisionIdSymbol, state.revisionId);
+  provide(AnnotationSetSymbol, state.annotationSet);
+  provide(AnnotationSetsSymbol, state.annotationSets);
+  provide(ComparisonSetsSymbol, state.comparisonSets);
+  provide(SegmentationPointsSymbol, state.segmentationPoints);
+  provide(SegmentationCursorLoadingSymbol, state.segmentationCursorLoading);
+  provide(TrackFilterControlsSymbol, state.trackFilters);
+  provide(TrackStyleManagerSymbol, state.trackStyleManager);
+  provide(SelectedCameraSymbol, state.selectedCamera);
   provide(SelectedKeySymbol, state.selectedKey);
   provide(SelectedTrackIdSymbol, state.selectedTrackId);
-  provide(StateStylesSymbol, state.stateStyles);
+  provide(EditingGroupIdSymbol, state.editingGroupId);
+  provide(EditingMultiTrackSymbol, state.editingMultiTrack);
   provide(TimeSymbol, state.time);
   provide(VisibleModesSymbol, state.visibleModes);
+  provide(ReadOnlyModeSymbol, state.readOnlyMode);
+  provide(ImageEnhancementsSymbol, state.imageEnhancements);
+  provide(PercentileStretchSupportedSymbol, state.percentileStretchSupported);
+  provide(PercentileHistogramSymbol, state.percentileHistogram);
+  provide(PercentileHistogramLoadingSymbol, state.percentileHistogramLoading);
   provide(HandlerSymbol, handler);
+  provide(AttributesFilterSymbol, attributesFilters);
 }
 
 function _handleMissing(s: symbol): Error {
@@ -335,62 +489,77 @@ function useAttributes() {
   return use<AttributesType>(AttributesSymbol);
 }
 
-function useAllTypes() {
-  return use<AllTypesType>(AllTypesSymbol);
+function useAttributesFilters() {
+  return use<AttributesFilterType>(AttributesFilterSymbol);
+}
+
+function useCameraStore() {
+  return use<CameraStore>(CameraStoreSymbol);
+}
+function useCameraRegistration() {
+  return use<CameraRegistrationStore>(CameraRegistrationSymbol);
+}
+function useAlignedView() {
+  return use<AlignedViewStore>(AlignedViewSymbol);
 }
 function useDatasetId() {
   return use<DatasetIdType>(DatasetIdSymbol);
-}
-function useUsedTypes() {
-  return use<UsedTypesType>(UsedTypesSymbol);
-}
-
-function useCheckedTrackIds() {
-  return use<CheckedTrackIdsType>(CheckedTrackIdsSymbol);
-}
-
-function useCheckedTypes() {
-  return use<CheckedTypesType>(CheckedTypesSymbol);
-}
-
-function useConfidenceFilters() {
-  return use<ConfidenceFiltersType>(ConfidenceFiltersSymbol);
-}
-
-function useEnabledTracks() {
-  return use<EnabledTracksType>(EnabledTracksSymbol);
 }
 
 function useEditingMode() {
   return use<EditingModeType>(EditingModeSymbol);
 }
 
+function useGroupFilterControls() {
+  return use<GroupFilterControls>(GroupFilterControlsSymbol);
+}
+
+function useGroupStyleManager() {
+  return use<StyleManager>(GroupStyleManagerSymbol);
+}
+
 function useHandler() {
   return use<Handler>(HandlerSymbol);
 }
 
-function useIntervalTree() {
-  return use<IntervalTreeType>(IntervalTreeSymbol);
+function useLassoModeContext() {
+  return use<LassoModeContext>(LassoModeSymbol);
 }
 
-function useMergeList() {
-  return use<MergeList>(MergeListSymbol);
+function useMultiSelectList() {
+  return use<MultiSelectType>(MultiSelectSymbol);
 }
 
 function usePendingSaveCount() {
   return use<pendingSaveCountType>(PendingSaveCountSymbol);
 }
 
-function useTrackMap() {
-  return use<TrackMapType>(TrackMapSymbol);
+function useProgress() {
+  return use<ProgressType>(ProgressSymbol);
 }
 
-function useFilteredTracks() {
-  return use<FilteredTracksType>(TracksSymbol);
+function useRevisionId() {
+  return use<RevisionIdType>(RevisionIdSymbol);
 }
 
-function useTypeStyling() {
-  return use<TypeStylingType>(TypeStylingSymbol);
+function useAnnotationSet() {
+  return use<AnnotationSetType>(AnnotationSetSymbol);
+}
+
+function useAnnotationSets() {
+  return use<AnnotationSetsType>(AnnotationSetsSymbol);
+}
+
+function useComparisonSets() {
+  return use<ComparisonSetsType>(ComparisonSetsSymbol);
+}
+
+function useTrackStyleManager() {
+  return use<StyleManager>(TrackStyleManagerSymbol);
+}
+
+function useSelectedCamera() {
+  return use<SelectedCameraType>(SelectedCameraSymbol);
 }
 
 function useSelectedKey() {
@@ -401,43 +570,91 @@ function useSelectedTrackId() {
   return use<SelectedTrackIdType>(SelectedTrackIdSymbol);
 }
 
-function useStateStyles() {
-  return use<StateStylesType>(StateStylesSymbol);
+function useEditingGroupId() {
+  return use<SelectedTrackIdType>(EditingGroupIdSymbol);
+}
+
+function useEditingMultiTrack() {
+  return use<EditingMultiTrackType>(EditingMultiTrackSymbol);
 }
 
 function useTime() {
   return use<TimeType>(TimeSymbol);
 }
 
+function useTrackFilters() {
+  return use<TrackFilterControls>(TrackFilterControlsSymbol);
+}
+
 function useVisibleModes() {
   return use<VisibleModesType>(VisibleModesSymbol);
 }
+function useReadOnlyMode() {
+  return use<ReadOnylModeType>(ReadOnlyModeSymbol);
+}
+function useImageEnhancements() {
+  return use<ImageEnhancementsType>(ImageEnhancementsSymbol);
+}
+
+function usePercentileStretchSupported() {
+  return use<PercentileStretchSupportedType>(PercentileStretchSupportedSymbol);
+}
+
+function usePercentileHistogram() {
+  return use<PercentileHistogramType>(PercentileHistogramSymbol);
+}
+
+function usePercentileHistogramLoading() {
+  return use<PercentileHistogramLoadingType>(PercentileHistogramLoadingSymbol);
+}
+
+function useSegmentationPoints() {
+  return use<SegmentationPointsType>(SegmentationPointsSymbol);
+}
+
+function useSegmentationCursorLoading() {
+  return use<SegmentationCursorLoadingType>(SegmentationCursorLoadingSymbol);
+}
 
 export {
+  LassoModeSymbol,
   dummyHandler,
   dummyState,
   provideAnnotator,
   use,
   useAnnotatorPreferences,
   useAttributes,
-  useAllTypes,
+  useCameraStore,
+  useCameraRegistration,
+  useAlignedView,
   useDatasetId,
-  useUsedTypes,
-  useCheckedTrackIds,
-  useCheckedTypes,
-  useConfidenceFilters,
-  useEnabledTracks,
   useEditingMode,
   useHandler,
-  useIntervalTree,
-  useMergeList,
+  useLassoModeContext,
+  useGroupFilterControls,
+  useGroupStyleManager,
+  useMultiSelectList,
   usePendingSaveCount,
-  useTrackMap,
-  useFilteredTracks,
-  useTypeStyling,
+  useProgress,
+  useRevisionId,
+  useAnnotationSet,
+  useAnnotationSets,
+  useComparisonSets,
+  useTrackFilters,
+  useTrackStyleManager,
+  useSelectedCamera,
   useSelectedKey,
   useSelectedTrackId,
-  useStateStyles,
+  useEditingGroupId,
+  useEditingMultiTrack,
   useTime,
   useVisibleModes,
+  useReadOnlyMode,
+  useImageEnhancements,
+  usePercentileStretchSupported,
+  usePercentileHistogram,
+  usePercentileHistogramLoading,
+  useAttributesFilters,
+  useSegmentationPoints,
+  useSegmentationCursorLoading,
 };

@@ -1,32 +1,38 @@
 <script lang="ts">
 import {
-  defineComponent, reactive, toRefs, onBeforeUnmount, toRef,
-} from '@vue/composition-api';
+  defineComponent, reactive, toRefs, onBeforeUnmount,
+} from 'vue';
 import { GirderAuthentication } from '@girder/components/src';
 
 import { useGirderRest } from 'platform/web-girder/plugins/girder';
+import { useRouter } from 'vue-router/composables';
+import { useBrand } from 'platform/web-girder/store/useBrand';
 
 export default defineComponent({
   name: 'Login',
   components: {
     GirderAuthentication,
   },
-  setup(_, { root }) {
+  setup() {
     const data = reactive({
       form: 'login',
       userDialog: true,
     });
-    const brandData = toRef(root.$store.state.Brand, 'brandData');
+    const router = useRouter();
+    const { brandData } = useBrand();
     const girderRest = useGirderRest();
     function onLogin() {
-      root.$router.push('/');
+      if (girderRest.token) {
+        window.localStorage.setItem('girderToken', girderRest.token);
+      }
+      router.push('/');
     }
     girderRest.$on('login', onLogin);
     onBeforeUnmount(() => girderRest.$off('login', onLogin));
 
     /** Redirect if user already logged in */
     if (girderRest.user) {
-      root.$router.replace('/');
+      router.replace('/');
       data.userDialog = false;
     }
 

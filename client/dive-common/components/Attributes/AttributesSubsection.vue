@@ -1,0 +1,421 @@
+<script lang="ts">
+import {
+  defineComponent,
+  ref,
+  PropType,
+  computed,
+} from 'vue';
+import {
+  useSelectedTrackId,
+  useCameraStore,
+  useTime,
+  useReadOnlyMode,
+  useAttributesFilters,
+} from 'vue-media-annotator/provides';
+import type { Attribute, AttributeFilter } from 'vue-media-annotator/use/AttributeTypes';
+import AttributeInput from 'dive-common/components/Attributes/AttributeInput.vue';
+import PanelSubsection from 'dive-common/components/PanelSubsection.vue';
+import TooltipBtn from 'vue-media-annotator/components/TooltipButton.vue';
+import context from 'dive-common/store/context';
+import { StringKeyObject } from 'vue-media-annotator/BaseAnnotation';
+
+export default defineComponent({
+  components: {
+    AttributeInput,
+    PanelSubsection,
+    TooltipBtn,
+  },
+  props: {
+    attributes: {
+      type: Array as PropType<Attribute[]>,
+      required: true,
+    },
+    editIndividual: {
+      type: Object as PropType<Attribute | null>,
+      default: null,
+    },
+    mode: {
+      type: String as PropType<'Track' | 'Detection'>,
+      required: true,
+    },
+    user: {
+      type: String as PropType<string>,
+      default: '',
+    },
+  },
+  setup(props, { emit }) {
+    const readOnlyMode = useReadOnlyMode();
+    const { frame: frameRef } = useTime();
+    const selectedTrackIdRef = useSelectedTrackId();
+    const { attributeFilters, sortAndFilterAttributes, timelineEnabled } = useAttributesFilters();
+    const cameraStore = useCameraStore();
+    const activeSettings = ref(true);
+    const sortingMethods = ['a-z', '1-0'];
+    const sortingMethodIcons = ['mdi-sort-alphabetical-ascending', 'mdi-sort-numeric-ascending'];
+    const sortingMode = ref(0);
+
+    // Logical-track reads: same projection as the track row, so Detection
+    // Attributes stay visible when the selected camera has no replica.
+    const selectedAttributes = computed(() => {
+      if (selectedTrackIdRef.value === null) {
+        return null;
+      }
+      try {
+        const projection = cameraStore.getTrackProjection(selectedTrackIdRef.value);
+        if (props.mode === 'Track') {
+          return projection;
+        }
+        const [real] = projection.getFeature(frameRef.value);
+        return real;
+      } catch {
+        return null;
+      }
+    });
+
+    const filteredFullAttributes = computed(() => {
+      let additionFilters: AttributeFilter[] = [];
+      let mode: 'track' | 'detection' = 'track';
+      if (props.mode === 'Track') {
+        additionFilters = attributeFilters.value.track;
+      } else {
+        additionFilters = attributeFilters.value.detection;
+        mode = 'detection';
+      }
+      let attributeVals = {};
+      if (selectedAttributes.value && selectedAttributes.value.attributes) {
+        attributeVals = selectedAttributes.value.attributes;
+      }
+      return sortAndFilterAttributes(props.attributes, mode, attributeVals, sortingMode.value, additionFilters);
+    });
+
+    const activeAttributesCount = computed(
+      () => props.attributes.filter(
+        (a) => selectedAttributes.value
+            && selectedAttributes.value.attributes
+            && selectedAttributes.value.attributes[a.name] !== undefined,
+      ).length,
+    );
+
+    function toggleActiveSettings() {
+      activeSettings.value = !activeSettings.value;
+    }
+
+    function updateAttribute(
+      { name, value }: { name: string; value: unknown },
+      attribute: Attribute,
+    ) {
+      if (selectedTrackIdRef.value !== null) {
+        let user: null | string = null;
+        if (attribute && attribute.user) {
+          user = props.user || null;
+        }
+        let updatedValue = value;
+        if (attribute.datatype === 'number' && value !== undefined) {
+          updatedValue = parseFloat(value as string);
+        }
+        if (props.mode === 'Track') {
+          cameraStore.setTrackAttribute(selectedTrackIdRef.value, name, updatedValue, user);
+        } else if (props.mode === 'Detection' && frameRef.value !== undefined) {
+          cameraStore.setTrackFeatureAttribute(
+            selectedTrackIdRef.value,
+            frameRef.value,
+            name,
+            updatedValue,
+            user,
+          );
+        }
+      }
+    }
+
+    function editAttribute(attribute: Attribute) {
+      emit('edit-attribute', attribute);
+    }
+
+    function setEditIndividual(attribute: Attribute) {
+      emit('set-edit-individual', attribute);
+    }
+    function addAttribute() {
+      emit('add-attribute', props.mode);
+    }
+    function clickSortToggle() {
+      sortingMode.value = (sortingMode.value + 1) % sortingMethods.length;
+    }
+
+    const filtersActive = computed(() => {
+      let additionFilters: AttributeFilter[] = [];
+      if (props.mode === 'Track') {
+        additionFilters = attributeFilters.value.track;
+      } else {
+        additionFilters = attributeFilters.value.detection;
+      }
+      return !!additionFilters.find((filter) => filter.filterData.active === true);
+    });
+
+    function openFilter() {
+      context.openClose('AttributesSideBar', true, 'Filtering');
+    }
+    function openTimeline() {
+      context.openClose('AttributesSideBar', true, 'Timeline');
+    }
+
+    function toAttributeValue(val: unknown): string | number | boolean | undefined {
+      if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+        return val;
+      }
+      return undefined;
+    }
+
+    function getAttributeValue(attribute: Attribute): string | number | boolean | undefined {
+      if (selectedAttributes.value && selectedAttributes.value.attributes) {
+        if (!attribute.user) {
+          return toAttributeValue(selectedAttributes.value.attributes[attribute.name]);
+        }
+        const user = props.user || null;
+        if (user && selectedAttributes.value.attributes?.userAttributes !== undefined
+        && selectedAttributes.value.attributes.userAttributes[user]) {
+          const userAttrs = selectedAttributes.value.attributes
+            .userAttributes[user] as StringKeyObject;
+          if (userAttrs[attribute.name]) {
+            return toAttributeValue(userAttrs[attribute.name]);
+          }
+        }
+      }
+      return undefined;
+    }
+
+    return {
+      frameRef,
+      activeAttributesCount,
+      selectedAttributes,
+      filteredFullAttributes,
+      activeSettings,
+      readOnlyMode,
+      //functions
+      toggleActiveSettings,
+      updateAttribute,
+      editAttribute,
+      addAttribute,
+      setEditIndividual,
+      getAttributeValue,
+      //Sorting & Filters
+      sortingMethodIcons,
+      sortingMode,
+      clickSortToggle,
+      openFilter,
+      openTimeline,
+      timelineEnabled,
+      filtersActive,
+    };
+  },
+});
+</script>
+
+<template>
+  <panel-subsection v-if="selectedAttributes">
+    <template
+      slot="header"
+    >
+      <v-row
+        class="align-center"
+        no-gutters
+      >
+        <v-col dense>
+          <b class="attribute-header">{{ mode }} Attributes</b>
+          <div
+            v-if="mode === 'Detection'"
+            no-gutters
+            class="text-caption"
+          >
+            {{ `Frame: ${frameRef}` }}
+          </div>
+        </v-col>
+        <v-tooltip
+          open-delay="200"
+          bottom
+          max-width="200"
+        >
+          <template #activator="{ on }">
+            <v-btn
+              small
+              icon
+              :disabled="readOnlyMode"
+              v-on="on"
+              @click="addAttribute"
+            >
+              <v-icon small>
+                mdi-plus
+              </v-icon>
+            </v-btn>
+          </template>
+          <span>Add a new {{ mode }} Attribute</span>
+        </v-tooltip>
+        <v-tooltip
+          open-delay="200"
+          bottom
+          max-width="200"
+        >
+          <template #activator="{ on }">
+            <v-btn
+              small
+              icon
+              class="ml-2"
+              :color="activeSettings ? 'accent' : ''"
+              v-on="on"
+              @click="toggleActiveSettings()"
+            >
+              <v-icon small>
+                mdi-eye
+              </v-icon>
+            </v-btn>
+          </template>
+          <span>Show/Hide un-used</span>
+        </v-tooltip>
+        <tooltip-btn
+          :icon="sortingMethodIcons[sortingMode]"
+          tooltip-text="Sort types by value or alphabetically"
+          @click="clickSortToggle"
+        />
+        <tooltip-btn
+          icon="mdi-filter"
+          :color="filtersActive ? 'primary' : 'default'"
+          :tooltip-text="filtersActive
+            ? 'Filters are active, click to view' : 'No filters are active, click to edit'"
+          @click="openFilter"
+        />
+        <tooltip-btn
+          v-if="mode === 'Detection'"
+          icon="mdi-chart-line-variant"
+          :color="timelineEnabled ? 'primary' : 'default'"
+          tooltip-text="Timeline Settings for Attributes"
+          @click="openTimeline"
+        />
+        <div
+          v-else
+          class="blank-spacer"
+        />
+      </v-row>
+    </template>
+
+    <template
+      v-if="selectedAttributes"
+      slot="scroll-section"
+    >
+      <v-col
+        v-if="
+          activeSettings || activeAttributesCount
+        "
+        class="pa-0"
+      >
+        <span
+          v-for="(attribute) of filteredFullAttributes"
+          :key="attribute.name"
+        >
+          <v-row
+            v-if="
+              activeSettings
+                || (selectedAttributes.attributes
+                  && selectedAttributes.attributes[attribute.name] !== undefined)
+            "
+            class="ma-0"
+            dense
+            align="center"
+          >
+            <v-col class="attribute-name"> <div
+              class="type-color-box"
+              :style="{
+                backgroundColor: attribute.color,
+              }"
+            /><span>{{ attribute.name }}:
+            </span>
+            </v-col>
+            <v-col class="px-1">
+              <AttributeInput
+                v-if="activeSettings"
+                :datatype="attribute.datatype"
+                :name="attribute.name"
+                :disabled="readOnlyMode"
+                :values="attribute.values ? attribute.values : undefined"
+                :value="getAttributeValue(attribute)"
+                :type-settings="attribute.editor || null"
+                @change="
+                  updateAttribute($event, attribute)"
+              />
+              <div v-else>
+                <div
+                  v-if="editIndividual != attribute"
+                  class="attribute-item-value"
+                  @click.stop="setEditIndividual(attribute)"
+                >
+                  {{ getAttributeValue(attribute) }}
+                </div>
+                <div v-else>
+                  <AttributeInput
+                    :datatype="attribute.datatype"
+                    :name="attribute.name"
+                    :disabled="readOnlyMode"
+                    :values="attribute.values ? attribute.values : undefined"
+                    :value="getAttributeValue(attribute)"
+                    :type-settings="attribute.editor || null"
+                    focus
+                    @change="updateAttribute($event, attribute)"
+                  />
+                </div>
+              </div>
+            </v-col>
+            <v-col
+              v-if="activeSettings"
+              cols="1"
+            >
+              <v-btn
+                icon
+                x-small
+                @click="editAttribute(attribute)"
+              >
+                <v-icon small> mdi-cog </v-icon>
+              </v-btn>
+            </v-col>
+          </v-row>
+        </span>
+      </v-col>
+      <v-col v-else>
+        <div style="font-size: 0.75em">
+          No {{ mode }} attributes set
+        </div>
+      </v-col>
+    </template>
+  </panel-subsection>
+</template>
+
+<style scoped lang="scss">
+.attribute-header {
+  font-size: 12px;
+}
+.attribute-item-value {
+  max-width: 80%;
+  margin: 0px;
+  &:hover {
+    cursor: pointer;
+    font-weight: bold;
+  }
+}
+.attribute-name {
+  font-size: 0.8em;
+  max-width: 50%;
+  min-width: 50%;
+}
+.type-color-box {
+  display: inline-block;
+  margin-right: 5px;
+  min-width: 8px;
+  max-width: 8px;
+  min-height: 8px;
+  max-height: 8px;
+}
+.blank-spacer {
+  min-width: 28px;
+  min-height: 28px;
+  max-width: 28px;
+  max-height: 28px;
+}
+
+</style>

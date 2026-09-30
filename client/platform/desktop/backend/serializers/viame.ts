@@ -3,37 +3,48 @@
  * dive_utils.serializers.viame python module
  */
 
-import csvparser from 'csv-parse';
+import { parse as csvparser } from 'csv-parse';
 import csvstringify from 'csv-stringify';
 import fs from 'fs-extra';
 import moment from 'moment';
-import { flattenDeep } from 'lodash';
+import { cloneDeep, flattenDeep, isEmpty } from 'lodash';
 import { pipeline, Readable, Writable } from 'stream';
 
-import { MultiTrackRecord } from 'dive-common/apispec';
-import { JsonMeta } from 'platform/desktop/constants';
+import {
+  AnnotationSchema, DatasetInfoFields, MultiGroupRecord, MultiTrackRecord,
+} from 'dive-common/apispec';
+import { JsonConfig } from 'platform/desktop/constants';
 import { splitExt } from 'platform/desktop/backend/native/utils';
 // Imports that involve actual code require relative imports because ts-node barely works
 // https://github.com/TypeStrong/ts-node/issues/422
 import Track, {
-  TrackData, Feature, StringKeyObject, ConfidencePair, TrackSupportedFeature,
+  TrackData, Feature, TrackSupportedFeature,
 } from 'vue-media-annotator/track';
+import { orderedHeadTail, syncHeadTail } from 'vue-media-annotator/headTail';
+import { ConfidencePair, StringKeyObject } from 'vue-media-annotator/BaseAnnotation';
 
 const CommentRegex = /^\s*#/g;
-const HeadRegex = /^\(kp\) head (-?[0-9]+\.*-?[0-9]*) (-?[0-9]+\.*-?[0-9]*)/g;
-const TailRegex = /^\(kp\) tail (-?[0-9]+\.*-?[0-9]*) (-?[0-9]+\.*-?[0-9]*)/g;
 const AttrRegex = /^\(atr\) (.*?)\s(.+)/g;
 const TrackAttrRegex = /^\(trk-atr\) (.*?)\s(.+)/g;
-const PolyRegex = /^(\(poly\)) ((?:-?[0-9]+\.*-?[0-9]*\s*)+)/g;
+// Polygon format: (poly) coordinates
+const PolyRegex = /^\(poly\)\s*((?:-?[0-9]+\.*-?[0-9]*\s*)+)/g;
+// Hole format: (hole) coordinates
+const HoleRegex = /^\(hole\)\s*((?:-?[0-9]+\.*-?[0-9]*\s*)+)/g;
+const NoteRegex = /^\(note\)\s*(.+)/g;
 const FpsRegex = /fps:\s*(\d+(\.\d+)?)/ig;
+const ExecTimeRegEx = /exec_time:\s*(\d+(\.\d+)?)/ig;
 const AtrToken = '(atr)';
 const TrackAtrToken = '(trk-atr)';
 const PolyToken = '(poly)';
 const KeypointToken = '(kp)';
+const NoteToken = '(note)';
 
 export interface AnnotationFileData {
-  tracks: TrackData[];
+  tracks: MultiTrackRecord;
+  groups: MultiGroupRecord;
   fps?: number;
+  execTime?: number;
+  datasetInfo?: DatasetInfoFields;
 }
 
 // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/matchAll
@@ -52,14 +63,29 @@ function getCaptureGroups(regexp: RegExp, str: string) {
 }
 
 function _rowInfo(row: string[]) {
+  let fps;
   if (row[0].match(CommentRegex) !== null) {
-    throw new Error('comment row');
+    // we have a comment, check for FPS
+    let hasComment = false;
+    if (row.length > 1) {
+      if (row[1].startsWith('Fps:')) {
+        const fpsSplit = row[1].split(':');
+        if (fpsSplit.length > 1) {
+          [, fps] = fpsSplit;
+          hasComment = true;
+        }
+      }
+    }
+    if (!hasComment) {
+      throw new Error('comment row');
+    }
   }
   if (row.length < 9) {
     throw new Error('malformed row: too few columns');
   }
   return {
-    trackId: parseInt(row[0], 10),
+    fps,
+    id: parseInt(row[0], 10),
     filename: row[1],
     frame: parseInt(row[2], 10),
     bounds: (
@@ -70,6 +96,62 @@ function _rowInfo(row: string[]) {
   };
 }
 
+/** Resolve detection length from attributes.length or fishLength (either may be set). */
+function resolveDetectionLength(
+  fishLength?: number,
+  attributes?: StringKeyObject,
+): number | undefined {
+  const lengthAttr = attributes?.length;
+  const fromAttr = lengthAttr !== undefined && lengthAttr !== null ? Number(lengthAttr) : NaN;
+  if (Number.isFinite(fromAttr)) {
+    return fromAttr;
+  }
+  if (fishLength !== undefined && Number.isFinite(fishLength) && fishLength !== -1) {
+    return fishLength;
+  }
+  return undefined;
+}
+
+/** Keep fishLength and attributes.length in sync when either is present. */
+function syncDetectionLengthFields(feature: Feature): Feature {
+  const resolved = resolveDetectionLength(feature.fishLength, feature.attributes);
+  if (resolved === undefined) {
+    return feature;
+  }
+  return {
+    ...feature,
+    fishLength: resolved,
+    attributes: { ...(feature.attributes || {}), length: resolved },
+  };
+}
+
+/**
+ * Read dataset info from a `dataset_info: <json>` comment field. Returns the parsed
+ * object, or a `warning` if the field is present but unusable so the import can continue.
+ */
+function parseDatasetInfo(row: string[]): {
+  datasetInfo?: DatasetInfoFields;
+  warning?: string;
+} {
+  const field = row.find((f) => f.trim().startsWith('dataset_info:'));
+  if (!field) {
+    return {};
+  }
+  const json = field.slice(field.indexOf(':') + 1).trim();
+  try {
+    const parsed = JSON.parse(json);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { datasetInfo: parsed as DatasetInfoFields };
+    }
+    // eslint-disable-next-line no-nested-ternary
+    const kind = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
+    return { warning: `Ignored dataset_info entry: expected a JSON object but got ${kind}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { warning: `Ignored malformed dataset_info entry (${message})` };
+  }
+}
+
 function parseCommentRow(row: string[]) {
   const fullrow = row.join(' ');
   const matches = getCaptureGroups(FpsRegex, fullrow);
@@ -77,7 +159,17 @@ function parseCommentRow(row: string[]) {
   if (matches !== null && matches.length >= 2) {
     fps = Number.parseFloat(matches[1]);
   }
-  return { fps };
+  let execTime: undefined | number;
+  const execMatches = getCaptureGroups(ExecTimeRegEx, fullrow);
+  if (execMatches !== null && execMatches.length >= 2) {
+    execTime = Number.parseFloat(execMatches[1]);
+  }
+
+  const { datasetInfo, warning } = parseDatasetInfo(row);
+
+  return {
+    fps, execTime, datasetInfo, warning,
+  };
 }
 
 function _deduceType(value: string): boolean | number | string {
@@ -87,11 +179,28 @@ function _deduceType(value: string): boolean | number | string {
   if (value === 'false') {
     return false;
   }
-  const float = parseFloat(value);
-  if (!Number.isNaN(float)) {
-    return float;
+  // Number() rejects partial parses — parseFloat would truncate
+  // filename-like values such as '0123ABC456' to their leading digits.
+  // Empty/whitespace strings coerce to 0, so they explicitly stay strings.
+  if (value.trim() !== '') {
+    const float = Number(value);
+    if (!Number.isNaN(float)) {
+      return float;
+    }
   }
   return value;
+}
+
+/**
+ * Get the next available polygon key for a feature collection.
+ */
+function _getNextPolygonKey(
+  geoFeatureCollection: GeoJSON.FeatureCollection<TrackSupportedFeature, GeoJSON.GeoJsonProperties>,
+): string {
+  const polygonCount = geoFeatureCollection.features.filter(
+    (f) => f.geometry.type === 'Polygon',
+  ).length;
+  return polygonCount > 0 ? String(polygonCount) : '';
 }
 
 /**
@@ -125,6 +234,28 @@ function _createGeoJsonFeature(
   return geoFeature;
 }
 
+/**
+ * Find an existing polygon feature by key and add a hole to it.
+ * @param geoFeatureCollection the feature collection to search
+ * @param coords hole coordinates
+ * @param key polygon key to find
+ */
+function _addHoleToPolygon(
+  geoFeatureCollection: GeoJSON.FeatureCollection<TrackSupportedFeature, GeoJSON.GeoJsonProperties>,
+  coords: number[][],
+  key = '',
+) {
+  const matchingFeature = geoFeatureCollection.features.find(
+    (feature) => feature.geometry.type === 'Polygon' && feature.properties?.key === key,
+  );
+  if (matchingFeature) {
+    // Add hole as additional ring to the polygon coordinates
+    (matchingFeature.geometry.coordinates as number[][][]).push(coords);
+    return true;
+  }
+  return false;
+}
+
 function _parseRow(row: string[]) {
   // Create empty feature collection
   const geoFeatureCollection:
@@ -134,6 +265,7 @@ function _parseRow(row: string[]) {
     };
   let attributes: StringKeyObject | undefined;
   const trackAttributes: StringKeyObject = {};
+  const notes: string[] = [];
   const cpStarti = 9; // Confidence pairs start at i=9
   const confidencePairs: ConfidencePair[] = row
     .slice(cpStarti, row.length)
@@ -150,21 +282,12 @@ function _parseRow(row: string[]) {
     })
     .filter((val) => val[0] !== '')
     .sort((a, b) => b[1] - a[1]);
-  const headTail: [number, number][] = [];
+
   const start = 9 + (confidencePairs.length * 2);
   row.slice(start).forEach((value) => {
-    /* Head */
-    const head = getCaptureGroups(HeadRegex, value);
-    if (head !== null) {
-      headTail[0] = [parseFloat(head[1]), parseFloat(head[2])];
-      geoFeatureCollection.features.push(_createGeoJsonFeature('Point', [headTail[0]], 'head'));
-    }
-
-    /* Tail */
-    const tail = getCaptureGroups(TailRegex, value);
-    if (tail !== null) {
-      headTail[1] = [parseFloat(tail[1]), parseFloat(tail[2])];
-      geoFeatureCollection.features.push(_createGeoJsonFeature('Point', [headTail[1]], 'tail'));
+    const kp = /^\(kp\)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/.exec(value);
+    if (kp && Number.isFinite(Number(kp[2])) && Number.isFinite(Number(kp[3]))) {
+      geoFeatureCollection.features.push(_createGeoJsonFeature('Point', [[Number(kp[2]), Number(kp[3])]], kp[1]));
     }
 
     /* Detection Attribute */
@@ -180,11 +303,13 @@ function _parseRow(row: string[]) {
       trackAttributes[trackattr[1]] = _deduceType(trackattr[2]);
     }
 
-    /* Polygon */
+    /* Polygon - format: (poly) coordinates
+     * Multiple (poly) entries create separate polygons with auto-generated keys */
     const poly = getCaptureGroups(PolyRegex, value);
     if (poly !== null) {
+      const coordString = poly[1];
       const coords: number[][] = [];
-      const polyList = poly[2].split(' ');
+      const polyList = coordString.split(' ');
       polyList.forEach((coord, j) => {
         if (j % 2 === 0) {
           // Filter out ODDs
@@ -193,24 +318,48 @@ function _parseRow(row: string[]) {
           }
         }
       });
-      geoFeatureCollection.features.push(_createGeoJsonFeature('Polygon', coords));
+      // Create new polygon with auto-generated key
+      const newKey = _getNextPolygonKey(geoFeatureCollection);
+      geoFeatureCollection.features.push(_createGeoJsonFeature('Polygon', coords, newKey));
+    }
+
+    /* Hole - format: (hole) coordinates
+     * Added to the most recent polygon */
+    const hole = getCaptureGroups(HoleRegex, value);
+    if (hole !== null) {
+      const coordString = hole[1];
+      const coords: number[][] = [];
+      const polyList = coordString.split(' ');
+      polyList.forEach((coord, j) => {
+        if (j % 2 === 0) {
+          // Filter out ODDs
+          if (polyList[j + 1]) {
+            coords.push([parseFloat(coord), parseFloat(polyList[j + 1])]);
+          }
+        }
+      });
+      // Add as hole to the most recent polygon
+      const polygons = geoFeatureCollection.features.filter((f) => f.geometry.type === 'Polygon');
+      if (polygons.length > 0) {
+        const lastPolyKey = polygons[polygons.length - 1].properties?.key || '';
+        _addHoleToPolygon(geoFeatureCollection, coords, lastPolyKey);
+      }
+    }
+
+    /* Note */
+    const note = getCaptureGroups(NoteRegex, value);
+    if (note !== null) {
+      notes.push(note[1]);
     }
   });
 
-  if (headTail[0] !== undefined && headTail[1] !== undefined) {
+  const headTail = orderedHeadTail(geoFeatureCollection.features);
+  if (headTail) {
     geoFeatureCollection.features.push(_createGeoJsonFeature('LineString', headTail, 'HeadTails'));
   }
 
-  // ensure confidence pairs list is not empty
-  if (confidencePairs.length === 0) {
-    // extract Detection or Length Confidence field
-    const confidence = parseFloat(row[7]) || 1.0;
-    // add a dummy pair with a default type
-    confidencePairs.push(['unknown', confidence] as ConfidencePair);
-  }
-
   return {
-    attributes, trackAttributes, confidencePairs, geoFeatureCollection,
+    attributes, trackAttributes, confidencePairs, geoFeatureCollection, notes,
   };
 }
 
@@ -221,128 +370,282 @@ function _parseFeature(row: string[]) {
     frame: rowInfo.frame,
     bounds: rowInfo.bounds,
   };
-  if (rowInfo.fishLength !== -1) {
+  if (rowInfo.fishLength > 0 && Number.isFinite(rowInfo.fishLength)) {
     feature.fishLength = rowInfo.fishLength;
   }
   if (rowData.attributes) {
     feature.attributes = rowData.attributes;
   }
+  if (feature.attributes?.length !== undefined && Number(feature.attributes.length) <= 0) {
+    delete feature.attributes.length;
+  }
+  const syncedFeature = syncDetectionLengthFields(feature);
   if (rowData.geoFeatureCollection.features.length > 0) {
-    feature.geometry = rowData.geoFeatureCollection;
+    syncedFeature.geometry = rowData.geoFeatureCollection;
+  }
+  if (rowData.notes.length > 0) {
+    syncedFeature.notes = rowData.notes;
   }
   return {
     rowInfo,
-    feature,
+    feature: syncedFeature,
     trackAttributes: rowData.trackAttributes,
     confidencePairs: rowData.confidencePairs,
   };
 }
 
-async function parse(input: Readable, imageMap?: Map<string, number>): Promise<AnnotationFileData> {
+async function parse(input: Readable, imageMap?: Map<string, number>): Promise<[AnnotationFileData, string[]]> {
   const parser = csvparser({
     delimiter: ',',
     // comment lines may not have the correct number of columns
     relaxColumnCount: true,
   });
   let fps: number | undefined;
+  let execTime: number | undefined;
+  let datasetInfo: DatasetInfoFields | undefined;
   const dataMap = new Map<number, TrackData>();
-  let reordered = false;
+  const missingImages: string[] = [];
+  const foundImages: {image: string; frame: number; csvFrame: number}[] = [];
+  const fallbackConfidence: Record<TrackData['id'], number> = {};
+  let error: Error | undefined;
+  let multiFrameTracks = false;
+  const warnings: string[] = [];
 
-  return new Promise<AnnotationFileData>((resolve, reject) => {
-    pipeline(input, parser, (err) => {
+  return new Promise<[AnnotationFileData, string[]]>((resolve, reject) => {
+    pipeline([input, parser], (err) => {
       // undefined err indicates successful exit
       if (err !== undefined) {
         reject(err);
       }
-      resolve({ tracks: Array.from(dataMap.values()), fps });
+
+      // Do a secondary pass for if we are only visualizing a subset of sequences of images
+      if (missingImages.length > 0 && imageMap !== undefined && foundImages.length) {
+        if (error !== undefined) { // Most likely a reorder error so reset it
+          error = undefined;
+        }
+        // We need to find the total number of images mapped and make sure they are continuous
+        // Also need to create a mapping of old frame numbers to new numbers
+        // Additionall a min/max frame is required to cap tracks and remove items outside the range
+        let minFrame = Infinity;
+        let maxFrame = -Infinity;
+        const frameMapper: Record<number, number> = {};
+        const filteredImages = foundImages.filter((item) => item.frame !== -1);
+        for (let i = 0; i < filteredImages.length; i += 1) {
+          if (filteredImages[i].frame === -1) {
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+          const k = i + 1;
+          if (k < filteredImages.length) {
+            const itemDifference = foundImages[k].csvFrame - filteredImages[i].csvFrame;
+            if (
+              foundImages[i].csvFrame + itemDifference !== filteredImages[k].csvFrame || filteredImages[i].frame + itemDifference !== filteredImages[k].frame) {
+            // We have misaligned image sequences so we error out
+              warnings.push(`A subsampling of images were used with the CSV but they were not sequential\n 
+                ${filteredImages[i].csvFrame + 1} !== ${filteredImages[k].csvFrame} || ${filteredImages[i].frame + 1} !== ${filteredImages[k].frame}\n
+                image1: ${filteredImages[i].image} image2: ${filteredImages[k].image} - these should be sequential in the CSV
+              \n`);
+            }
+          }
+          frameMapper[filteredImages[i].csvFrame] = filteredImages[i].frame;
+          minFrame = Math.min(minFrame, filteredImages[i].csvFrame);
+          maxFrame = Math.max(maxFrame, filteredImages[i].csvFrame);
+        }
+        // Now we need to remap and filter tracks that are outside the frame range
+        const newDataMap: Record<TrackData['id'], TrackData> = {};
+        const trackList = Object.values(Object.fromEntries(dataMap));
+        trackList.forEach((track) => {
+          if ((track.end >= minFrame)
+          || (track.begin <= maxFrame)) {
+            // begin and end frames need to be remapped to the subsampled region
+            let { begin } = track;
+            let { end } = track;
+            if (begin < minFrame || frameMapper[begin] === undefined) {
+              begin = frameMapper[minFrame];
+            } else {
+              begin = frameMapper[begin];
+            }
+            if (end > maxFrame || frameMapper[end] === undefined) {
+              end = frameMapper[maxFrame];
+            } else {
+              end = frameMapper[end];
+            }
+            const newTrack: TrackData = {
+              begin,
+              end,
+              id: track.id,
+              attributes: track.attributes,
+              confidencePairs: track.confidencePairs,
+              features: [],
+            };
+            track.features.forEach((feature) => {
+              // if feature frame is within the range add and remap the frame to the new time
+              if (feature.frame >= minFrame && feature.frame <= maxFrame) {
+                const newFeature = cloneDeep(feature);
+                newFeature.frame = frameMapper[newFeature.frame];
+                newTrack.features.push(newFeature);
+              }
+            });
+            if (newTrack.features.length) {
+              // Only add the track if it has features
+              newDataMap[newTrack.id] = newTrack;
+            }
+          }
+        });
+        // Clear the existing dataMap to add the updated data
+        dataMap.clear();
+
+        // Set the new data in the dataMap
+        Object.values(newDataMap).forEach((track) => {
+          dataMap.set(track.id, track);
+        });
+      } else if (missingImages.length === 0 && foundImages.length && multiFrameTracks) {
+        foundImages.sort((a, b) => a.csvFrame - b.csvFrame); // Sort to frame
+        for (let i = 0; i < foundImages.length; i += 1) {
+          const k = i + 1;
+          if (k < foundImages.length) {
+            if (foundImages[i].csvFrame > foundImages[k].csvFrame || foundImages[i].frame > foundImages[k].frame) {
+            // We have misaligned video sequences so we error out
+              warnings.push(`Images were provided in an unexpected order and dataset contains multi-frame tracks.\n
+              image${i}: frame: ${foundImages[i].frame} csvFrame: ${foundImages[i].csvFrame}
+              image${k}: frame: ${foundImages[k].frame} csvFrame: ${foundImages[k].csvFrame}`);
+            }
+          }
+        }
+      }
+      dataMap.forEach((track) => {
+        if (track.confidencePairs.length === 0) {
+          // eslint-disable-next-line no-param-reassign
+          track.confidencePairs = [['unknown', fallbackConfidence[track.id] ?? 1.0]];
+        }
+      });
+      const tracks = Object.fromEntries(dataMap);
+
+      if (error !== undefined) {
+        reject(error);
+      }
+      resolve([{
+        tracks, groups: {}, fps, execTime, datasetInfo,
+      }, warnings]);
     });
     parser.on('readable', () => {
       let record: string[];
-      let hasFilenames: undefined | boolean;
       // eslint-disable-next-line no-cond-assign
       while (record = parser.read()) {
         try {
           const {
             rowInfo, feature, trackAttributes, confidencePairs,
           } = _parseFeature(record);
-          const currentHasFileName = rowInfo.filename.trim() !== '';
-          if (imageMap !== undefined && hasFilenames === undefined) {
-            hasFilenames = currentHasFileName;
-          } else if (imageMap !== undefined && hasFilenames !== currentHasFileName) {
-            throw new Error('Image Filenames specified in the Column 2 of the CSV must either be all set or all empty. Encountered a mixture of set and empty filenames');
+          if (rowInfo.fps) {
+            const parsedFps = parseInt(rowInfo.fps, 10);
+            if (!Number.isNaN(parsedFps)) {
+              fps = parsedFps;
+            }
+            throw new Error('comment row with FPS');
           }
-          if (imageMap !== undefined && hasFilenames) {
-            // validate image ordering if the imageMap is provided and a non-whitespace filename
+          if (imageMap !== undefined) {
             const [imageName] = splitExt(rowInfo.filename);
             const expectedFrameNumber = imageMap.get(imageName);
+            // Create a foundImage to map frames if a subset of images are used
+            const foundImage = {
+              image: imageName,
+              frame: expectedFrameNumber !== undefined ? expectedFrameNumber : -1,
+              csvFrame: rowInfo.frame,
+            };
+            const hasImageAlready = foundImages.find(
+              (item) => (item.frame === foundImage.frame && item.image === foundImage.image),
+            );
+            if (foundImage.frame !== -1 && hasImageAlready === undefined) {
+              foundImages.push(foundImage);
+            }
             if (expectedFrameNumber === undefined) {
-              throw new Error(
-                `encountered annotation for image not found in dataset: ${rowInfo.filename}`,
-              );
-            } else if (expectedFrameNumber !== feature.frame) {
-              // force reorder the annotations
-              reordered = true;
-              feature.frame = expectedFrameNumber;
-              rowInfo.frame = expectedFrameNumber;
+              missingImages.push(rowInfo.filename);
             }
           }
 
-          let track = dataMap.get(rowInfo.trackId);
+          let track = dataMap.get(rowInfo.id);
           if (track === undefined) {
             // Create new track if not exists in map
             track = {
               begin: rowInfo.frame,
               end: rowInfo.frame,
-              trackId: rowInfo.trackId,
+              id: rowInfo.id,
               attributes: {},
               confidencePairs: [],
               features: [],
             };
-            dataMap.set(rowInfo.trackId, track);
-          } else if (reordered) {
-            // trackId was already in dataMap, so the track has more than 1 detection.
-            throw new Error(
-              'annotations were provided in an unexpected order and dataset contains multi-frame tracks',
-            );
+            dataMap.set(rowInfo.id, track);
+          } else {
+            multiFrameTracks = true;
+            let maxFeatureFrame = -Infinity;
+            track.features.forEach((subFeature) => {
+              maxFeatureFrame = Math.max(maxFeatureFrame, subFeature.frame);
+            });
+            if (rowInfo.frame < maxFeatureFrame) {
+            // trackId was already in dataMap, and frame is out of order
+              warnings.push(
+                `annotations were provided in an unexpected order and dataset contains multi-frame tracks:
+                id: ${rowInfo.id}  filename: ${rowInfo.filename}  frame: ${rowInfo.frame}
+                maxFeatureFrame: ${maxFeatureFrame}`,
+              );
+              // eslint-disable-next-line no-continue
+              continue;
+            }
           }
           track.begin = Math.min(rowInfo.frame, track.begin);
           track.end = Math.max(rowInfo.frame, track.end);
           track.features.push(feature);
-          track.confidencePairs = confidencePairs;
+          // Pairs may be written on only one row of a track; rows without
+          // pairs must not clobber those already seen.
+          if (confidencePairs.length) {
+            track.confidencePairs = confidencePairs;
+          } else {
+            fallbackConfidence[track.id] = parseFloat(record[7]) || 1.0;
+          }
           Object.entries(trackAttributes).forEach(([key, val]) => {
             // "track is possibly undefined" seems like a bug
-            // eslint-disable-next-line @typescript-eslint/ban-ts-ignore
-            // @ts-ignore
-            track.attributes[key] = val;
+            if (track && track.attributes) {
+              track.attributes[key] = val;
+            }
           });
         } catch (err) {
           if (!(err instanceof Error)) {
-            throw new Error(`Caught unexpected error ${err}`);
+            error = new Error(`Caught unexpected error ${err}`);
+            // eslint-disable-next-line no-continue
+            continue;
           }
           if (err.toString().includes('comment row')) {
             // parse comment row
-            fps = fps || parseCommentRow(record).fps;
+            const parsedComment = parseCommentRow(record);
+            fps = fps || parsedComment.fps;
+            if (parsedComment.execTime) {
+              execTime = parsedComment.execTime;
+            }
+            if (parsedComment.datasetInfo) {
+              datasetInfo = parsedComment.datasetInfo;
+            }
+            if (parsedComment.warning) {
+              warnings.push(parsedComment.warning);
+            }
           } else if (!err.toString().includes('malformed row')) {
             // Allow malformed row errors
-            throw err;
+            error = err;
+            // eslint-disable-next-line no-continue
+            continue;
           }
         }
       }
-    });
-    parser.on('error', (err) => {
-      console.error(err);
-      reject(err);
     });
   });
 }
 
 async function parseFile(path: string, imageMap?: Map<string, number>):
-  Promise<AnnotationFileData> {
+  Promise<[AnnotationFileData, string[]]> {
   const stream = fs.createReadStream(path);
   return parse(stream, imageMap);
 }
 
-async function writeHeader(writer: Writable, meta: JsonMeta) {
+async function writeHeader(writer: Writable, meta: JsonConfig) {
   writer.write([
     '# 1: Detection or Track-id',
     '2: Video or Image Identifier',
@@ -356,20 +659,31 @@ async function writeHeader(writer: Writable, meta: JsonMeta) {
     '10-11+: Repeated Species',
     'Confidence Pairs or Attributes',
   ]);
-  if (meta.fps) {
-    writer.write([
+  // Omit datasetInfo when empty so existing exports stay unchanged.
+  const datasetInfo = meta.datasetInfo && !isEmpty(meta.datasetInfo)
+    ? meta.datasetInfo
+    : undefined;
+  if (meta.fps || datasetInfo) {
+    const metadataRow = [
       '# metadata',
       `fps: ${meta.fps}`,
       `exported_by: ${JSON.stringify('dive:typescript')}`,
       `exported_time: ${JSON.stringify((new Date()).toLocaleString())}`,
-    ]);
+    ];
+    if (meta.execTime) {
+      metadataRow.push(`exec_time: ${meta.execTime}`);
+    }
+    if (datasetInfo) {
+      metadataRow.push(`dataset_info: ${JSON.stringify(datasetInfo)}`);
+    }
+    writer.write(metadataRow);
   }
 }
 
 async function serialize(
   stream: Writable,
-  data: MultiTrackRecord,
-  meta: JsonMeta,
+  data: AnnotationSchema,
+  meta: JsonConfig,
   typeFilter = new Set<string>(),
   options = {
     excludeBelowThreshold: false,
@@ -386,11 +700,11 @@ async function serialize(
       resolve();
     });
     writeHeader(stringify, meta);
-    Object.values(data).forEach((track) => {
+    Object.values(data.tracks).forEach((track) => {
       const filters = meta.confidenceFilters || {};
       /* Include only the pairs that exceed the threshold in CSV output */
       const confidencePairs = options.excludeBelowThreshold
-        ? Track.trackExceedsThreshold(track.confidencePairs, filters)
+        ? Track.exceedsThreshold(track.confidencePairs, filters)
         : track.confidencePairs;
       const filteredPairs = typeFilter.size > 0
         ? confidencePairs.filter((x) => typeFilter.has(x[0]))
@@ -423,42 +737,64 @@ async function serialize(
               column2 = moment.utc((feature.frame / meta.fps) * 1000).format('HH:mm:ss.SSSSSS');
             }
 
+            const lengthValue = resolveDetectionLength(feature.fishLength, feature.attributes);
+
             const row = [
-              track.trackId,
+              track.id,
               column2,
               feature.frame,
               ...(feature.bounds as number[]),
               sortedPairs[0][1], // always take highest confidence to be track confidence
-              feature.fishLength || -1,
+              (lengthValue !== undefined && Number.isFinite(lengthValue)) ? lengthValue : -1,
               ...flattenDeep(sortedPairs),
             ];
 
-            /* Feature Attributes */
-            Object.entries(feature.attributes || {}).forEach(([key, val]) => {
+            /* Feature Attributes — export length in (atr) as well as the length column */
+            const exportAttributes = { ...(feature.attributes || {}) };
+            if (lengthValue !== undefined && Number.isFinite(lengthValue)) {
+              exportAttributes.length = lengthValue;
+            }
+            Object.entries(exportAttributes).forEach(([key, val]) => {
               row.push(`${AtrToken} ${key} ${val}`);
             });
-
             /* Track Attributes */
-            Object.entries(track.attributes).forEach(([key, val]) => {
+            Object.entries(track.attributes || {}).forEach(([key, val]) => {
               row.push(`${TrackAtrToken} ${key} ${val}`);
             });
 
             /* Geometry */
             if (feature.geometry && feature.geometry.type === 'FeatureCollection') {
-              feature.geometry.features.forEach((geoJSONFeature) => {
+              syncHeadTail(feature.geometry.features).forEach((geoJSONFeature) => {
                 if (geoJSONFeature.geometry.type === 'Polygon') {
-                  const coordinates = flattenDeep(geoJSONFeature.geometry.coordinates[0]);
-                  row.push(`${PolyToken} ${coordinates.map(Math.round).join(' ')}`);
+                  const allRings = geoJSONFeature.geometry.coordinates as number[][][];
+
+                  // Write outer ring (first ring)
+                  if (allRings.length > 0) {
+                    const outerCoords = flattenDeep(allRings[0]);
+                    row.push(`${PolyToken} ${outerCoords.map(Math.round).join(' ')}`);
+
+                    // Write holes (additional rings)
+                    for (let holeIdx = 0; holeIdx < allRings.length - 1; holeIdx += 1) {
+                      const holeCoords = flattenDeep(allRings[holeIdx + 1]);
+                      row.push(`(hole) ${holeCoords.map(Math.round).join(' ')}`);
+                    }
+                  }
                 } else if (geoJSONFeature.geometry.type === 'Point') {
                   if (geoJSONFeature.properties) {
                     const kpname = geoJSONFeature.properties.key;
                     const { coordinates } = geoJSONFeature.geometry;
                     row.push(
-                      `${KeypointToken} ${kpname} ${coordinates.map(Math.round).join(' ')}`,
+                      `${KeypointToken} ${kpname} ${coordinates.join(' ')}`,
                     );
                   }
                 }
-                /* TODO support for multiple GeoJSON Objects of the same type */
+              });
+            }
+
+            /* Notes */
+            if (feature.notes && feature.notes.length > 0) {
+              feature.notes.forEach((noteText) => {
+                row.push(`${NoteToken} ${noteText}`);
               });
             }
             stringify.write(row);
@@ -472,8 +808,8 @@ async function serialize(
 
 async function serializeFile(
   path: string,
-  data: MultiTrackRecord,
-  meta: JsonMeta,
+  data: AnnotationSchema,
+  meta: JsonConfig,
   typeFilter = new Set<string>(),
   options = {
     excludeBelowThreshold: false,

@@ -1,17 +1,61 @@
-import Install, { Ref, watch, reactive } from '@vue/composition-api';
+import { Ref, watch, reactive } from 'vue';
 import { cloneDeep, merge } from 'lodash';
-import Vue from 'vue';
 import { AnnotatorPreferences } from 'vue-media-annotator/types';
+import isDesktopRuntime from 'dive-common/isDesktopRuntime';
+import { DEFAULT_STEREO_MATCH_METHOD, isStereoMatchMethod } from 'dive-common/use/stereo/stereoMatcher';
+import type { StereoMatchMethod } from 'dive-common/use/stereo/stereoMatcher';
+
+interface ColumnVisibilitySettings {
+  type: boolean;
+  confidence: boolean;
+  startFrame: boolean;
+  endFrame: boolean;
+  startTimestamp: boolean;
+  endTimestamp: boolean;
+  notes: boolean;
+  attributeColumns: string[]; // Array of attribute keys to show as columns
+}
 
 interface AnnotationSettings {
   typeSettings: {
+    trackSortDir: 'a-z' | 'count' | 'frame count';
     showEmptyTypes: boolean;
     lockTypes: boolean;
+    preventCascadeTypes?: boolean;
+    filterTypesByFrame?: boolean;
+    maxCountButton?: boolean;
+    showTotalCount?: boolean;
+    showFrameCount?: boolean;
+    // Region of this type: detections whose geometry lies at least
+    // suppressionThreshold percent under it are hidden and excluded from
+    // counts. Attribute of this name set true: detection stays visible with
+    // its real type (optional dashed/fill styling and eye-off tag) and is
+    // excluded from its own type's counts. Empty string disables both.
+    suppressionType?: string;
+    // Minimum covered percent (0-100] for region suppression;
+    // out-of-range values fall back to the default (99).
+    suppressionThreshold?: number;
+    // Where per-type/track/group color and style overrides are stored.
+    // 'shared': one set of colors is reused across every dataset (per user on
+    // web, across all sequences on desktop). 'dataset': colors are saved only
+    // with the dataset they were set on (the original behavior).
+    colorScope?: 'shared' | 'dataset';
   };
   trackSettings: {
     newTrackSettings: {
       mode: 'Track' | 'Detection';
       type: string;
+      /** Segment a freshly drawn box or line and store the polygon. */
+      autoPopulateMask: boolean;
+      /** Browser point-prompt segmentation model (loaded lazily). */
+      segmentationModel: 'sam2' | 'sam2-small';
+      /**
+       * Where the browser SAM session runs: prefer hardware WebGPU, force GPU,
+       * or force WASM/CPU. Auto still falls back to CPU if GPU load fails.
+       */
+      segmentationDevice: 'auto' | 'gpu' | 'cpu';
+      /** Derive head/tail from that polygon for a box; a tighter box from it for a line. */
+      autoPopulatePoints: boolean;
       modeSettings: {
         Track: {
           autoAdvanceFrame: boolean;
@@ -25,10 +69,52 @@ interface AnnotationSettings {
     deletionSettings: {
       promptUser: boolean;
     };
+    trackListSettings: {
+      autoZoom?: boolean;
+      filterDetectionsByFrame?: boolean;
+      columnVisibility?: ColumnVisibilitySettings;
+    }
+  };
+  groupSettings: {
+    newGroupSettings: {
+      type: string;
+    };
   };
   rowsPerPage: number;
   annotationFPS: number;
   annotatorPreferences: AnnotatorPreferences;
+  timelineCountSettings: {
+    totalCount: boolean;
+    defaultView: 'tracks' | 'detections';
+  };
+  multiCamSettings: {
+    showToolbar: boolean;
+  };
+  layoutSettings: {
+    sidebarPosition: 'left' | 'bottom';
+  };
+  autoSaveSettings: {
+    enabled: boolean;
+    delaySeconds: number;
+  };
+  stereoSettings: {
+    // When importing a new camera file, optionally drop length measurements
+    // computed against the previous calibration.
+    clearLengthOnCameraFileLoad: boolean;
+    // Recompute length attributes when a line's vertices are modified on a
+    // detection that is linked across both cameras.
+    updateLengthsOnModify: boolean;
+    // Warp an annotation drawn on one camera to the other camera when that
+    // camera has no detection for it yet.
+    autoComputeOtherCamera: boolean;
+    // Which correspondence method warps points between the cameras: 'ncc'
+    // template matching, 'dino' (desktop only) NCC with DINO candidate
+    // selection, or 'foundation' dense disparity. Desktop maps each onto a
+    // VIAME interactive stereo config; web runs the model in the browser.
+    matchMethod: StereoMatchMethod;
+    loading: boolean;
+    loadingMessage: string;
+  };
 }
 
 const defaultSettings: AnnotationSettings = {
@@ -36,6 +122,10 @@ const defaultSettings: AnnotationSettings = {
     newTrackSettings: {
       mode: 'Track' as 'Track' | 'Detection',
       type: 'unknown',
+      autoPopulateMask: false,
+      segmentationModel: 'sam2',
+      segmentationDevice: 'auto',
+      autoPopulatePoints: false,
       modeSettings: {
         Track: {
           autoAdvanceFrame: false,
@@ -49,10 +139,38 @@ const defaultSettings: AnnotationSettings = {
     deletionSettings: {
       promptUser: true,
     },
+    trackListSettings: {
+      autoZoom: false,
+      filterDetectionsByFrame: false,
+      columnVisibility: {
+        type: true,
+        confidence: true,
+        startFrame: true,
+        endFrame: true,
+        startTimestamp: false,
+        endTimestamp: false,
+        notes: true,
+        attributeColumns: [],
+      },
+    },
+  },
+  groupSettings: {
+    newGroupSettings: {
+      type: 'unknown',
+    },
   },
   typeSettings: {
+    trackSortDir: 'a-z',
     showEmptyTypes: false,
     lockTypes: false,
+    preventCascadeTypes: false,
+    filterTypesByFrame: false,
+    maxCountButton: false,
+    showTotalCount: true,
+    showFrameCount: true,
+    suppressionType: 'Suppressed',
+    suppressionThreshold: 99,
+    colorScope: 'shared',
   },
   rowsPerPage: 20,
   annotationFPS: 10,
@@ -61,23 +179,111 @@ const defaultSettings: AnnotationSettings = {
       before: 20,
       after: 10,
     },
+    lockedCamera: {
+      enabled: false,
+      multiBounds: false,
+      transition: false,
+    },
+    showUserCreatedIcon: false,
+    showSuppressedTags: true,
+    suppressionDisplay: {
+      enabled: true,
+      dashed: true,
+      outlineOpacity: 1,
+      fillColor: '',
+      fillOpacity: 0.3,
+    },
+  },
+  timelineCountSettings: {
+    totalCount: true,
+    defaultView: 'tracks',
+  },
+  multiCamSettings: {
+    showToolbar: true,
+  },
+  layoutSettings: {
+    sidebarPosition: 'left',
+  },
+  autoSaveSettings: {
+    enabled: false, // Disabled by default for backward compatibility
+    // Shorter default delay on desktop; web keeps the longer default to reduce server churn.
+    delaySeconds: isDesktopRuntime() ? 15 : 60,
+  },
+  stereoSettings: {
+    clearLengthOnCameraFileLoad: true,
+    updateLengthsOnModify: true,
+    autoComputeOtherCamera: false,
+    matchMethod: DEFAULT_STEREO_MATCH_METHOD,
+    loading: false,
+    loadingMessage: '',
   },
 };
+const MIN_AUTO_SAVE_DELAY_SECONDS = 10;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function hydrate(obj: any): AnnotationSettings {
-  return merge(cloneDeep(defaultSettings), obj);
+// Utility to safely load from localStorage
+function loadStoredSettings(): Partial<AnnotationSettings> {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem('Settings');
+      return raw ? JSON.parse(raw) : {};
+    }
+  } catch (e) {
+    console.warn('Failed to load settings from localStorage:', e);
+  }
+  return {};
 }
 
-// TODO remove this: this won't be necessary in Vue 3
-Vue.use(Install);
-
-//Load default settings initially
-const storedSettings = JSON.parse(localStorage.getItem('Settings') || '{}');
-const clientSettings = reactive(hydrate(storedSettings));
-
+// Utility to safely save to localStorage
 function saveSettings() {
-  localStorage.setItem('Settings', JSON.stringify(clientSettings));
+  try {
+    if (typeof localStorage !== 'undefined') {
+      // Exclude transient stereo fields from persistence
+      const toSave = {
+        ...clientSettings,
+        stereoSettings: {
+          ...clientSettings.stereoSettings,
+          loading: false,
+          loadingMessage: '',
+        },
+      };
+      localStorage.setItem('Settings', JSON.stringify(toSave));
+    }
+  } catch (e) {
+    console.warn('Failed to save settings to localStorage:', e);
+  }
+}
+
+function hydrate(obj: Partial<AnnotationSettings>): AnnotationSettings {
+  const hydrated = merge(cloneDeep(defaultSettings), obj);
+  hydrated.autoSaveSettings.delaySeconds = Math.max(
+    MIN_AUTO_SAVE_DELAY_SECONDS,
+    Number(hydrated.autoSaveSettings.delaySeconds) || defaultSettings.autoSaveSettings.delaySeconds,
+  );
+  if (!isStereoMatchMethod(hydrated.stereoSettings.matchMethod, isDesktopRuntime())) {
+    hydrated.stereoSettings.matchMethod = DEFAULT_STEREO_MATCH_METHOD;
+  }
+  // Drop retired browser options (e.g. SAM3) that no longer fit typical GPUs.
+  if (hydrated.trackSettings.newTrackSettings.segmentationModel !== 'sam2'
+    && hydrated.trackSettings.newTrackSettings.segmentationModel !== 'sam2-small') {
+    hydrated.trackSettings.newTrackSettings.segmentationModel = 'sam2';
+  }
+  const device = hydrated.trackSettings.newTrackSettings.segmentationDevice;
+  if (device !== 'auto' && device !== 'gpu' && device !== 'cpu') {
+    hydrated.trackSettings.newTrackSettings.segmentationDevice = 'auto';
+  }
+  return hydrated;
+}
+
+const clientSettings = reactive(hydrate(loadStoredSettings()));
+
+/**
+ * Either stereo feature (length update or cross-camera auto-compute) puts the
+ * annotator in interactive stereo mode. Desktop serves both from the VIAME
+ * interactive service; web warps and triangulates client-side instead.
+ */
+function isStereoInteractiveModeEnabled(): boolean {
+  return clientSettings.stereoSettings.updateLengthsOnModify
+    || clientSettings.stereoSettings.autoComputeOtherCamera;
 }
 
 export default function setup(allTypes: Ref<Readonly<string[]>>) {
@@ -88,9 +294,14 @@ export default function setup(allTypes: Ref<Readonly<string[]>>) {
     }
   });
 }
-watch(clientSettings, saveSettings);
+watch(clientSettings, saveSettings, { deep: true });
 
 export {
   clientSettings,
+  isStereoInteractiveModeEnabled,
+};
+
+export type {
   AnnotationSettings,
+  ColumnVisibilitySettings,
 };

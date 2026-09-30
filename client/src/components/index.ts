@@ -1,34 +1,58 @@
 /**
- * TODO: DANGER: this file must be a javascript (not typescript)
- * file for the sake of rollup build process.
- * See rollup.config.js for more
+ * Barrel re-export of annotator UI components (used by the app and tests).
  */
 
 import ImageAnnotator from './annotators/ImageAnnotator.vue';
 import VideoAnnotator from './annotators/VideoAnnotator.vue';
+import LargeImageAnnotator from './annotators/LargeImageAnnotator.vue';
+import AnnotatorImageCursor from './annotators/AnnotatorImageCursor.vue';
 
 import Controls from './controls/Controls.vue';
 import EventChart from './controls/EventChart.vue';
+import FileNameTimeDisplay from './controls/FileNameTimeDisplay.vue';
 import LineChart from './controls/LineChart.vue';
 import Timeline from './controls/Timeline.vue';
 
+import FilterList from './Types/FilterList.vue';
+import GroupEditor from './GroupEditor.vue';
+import GroupList from './GroupList.vue';
+import GroupItem from './GroupItem.vue';
+import ImageEnhancements from './ImageEnhancements.vue';
 import LayerManager from './LayerManager.vue';
 import TooltipButton from './TooltipButton.vue';
-import TrackItem from './TrackItem.vue';
-import TrackList from './TrackList.vue';
-import TypeList from './TypeList.vue';
+import TrackItem from './Tracks/TrackItem.vue';
+import TrackList from './Tracks/TrackList.vue';
+import TypeEditor from './Types/TypeEditor.vue';
+import TypeItem from './Types/TypeItem.vue';
+import TypePicker from './Types/TypePicker.vue';
 
 export * from './annotators/useMediaController';
+export { default as useAnnotatorImageCursor } from './annotators/useAnnotatorImageCursor';
+export { default as useRegistrationNavigation } from './annotators/linkedViewers/useRegistrationNavigation';
+export { default as useAlignedNavigation } from './annotators/linkedViewers/useAlignedNavigation';
 export {
+  /* Annotators */
+  AnnotatorImageCursor,
   ImageAnnotator,
   VideoAnnotator,
+  LargeImageAnnotator,
+  /* Controls */
   Controls,
   EventChart,
+  FileNameTimeDisplay,
   LineChart,
   Timeline,
+  /* Components */
+  FilterList,
+  GroupEditor,
+  GroupItem,
+  GroupList,
+  ImageEnhancements,
   LayerManager,
   TooltipButton,
   TrackItem,
   TrackList,
-  TypeList,
+  TypeEditor,
+  TypeItem,
+  TypePicker,
 };

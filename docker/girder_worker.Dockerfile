@@ -1,75 +1,69 @@
-# ========================
-# == SERVER BUILD STAGE ==
-# ========================
-# Note: server-builder stage will be the same in both dockerfiles
-FROM python:3.7-buster as server-builder
-
-WORKDIR /opt/dive/src
-
-# https://cryptography.io/en/latest/installation/#debian-ubuntu
-RUN apt-get update
-RUN apt-get install -y build-essential libssl-dev libffi-dev python3-dev cargo npm
-# Recommended poetry install https://python-poetry.org/docs/master/#installation
-RUN curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.1.2 POETRY_HOME=/opt/dive/local python -
-ENV PATH="/opt/dive/local/venv/bin:$PATH"
-# Copy only the lock and project files to optimize cache
-COPY server/pyproject.toml server/poetry.lock /opt/dive/src/
-# Use the system installation
-RUN poetry env use system
-RUN poetry config virtualenvs.create false
-# Install dependencies only
-RUN poetry install --no-root
-# Build girder client, including plugins like worker/jobs
-# RUN girder build
-
-# Copy full source code and install
-COPY server/ /opt/dive/src/
-RUN poetry install --no-dev
-
 # ====================
 # == FFMPEG FETCHER ==
 # ====================
-FROM python:3.7-buster as ffmpeg-builder
-RUN wget -O ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-RUN mkdir /tmp/ffextracted
-RUN tar -xvf ffmpeg.tar.xz -C /tmp/ffextracted --strip-components 1
+# BtbN FFmpeg 8.1 release-branch builds (not git master). Supports -/headers so
+# Girder tokens need not appear in ffprobe argv. See:
+# https://github.com/BtbN/FFmpeg-Builds/releases/latest
+FROM python:3.11-bookworm AS ffmpeg-builder
+ARG TARGETARCH
+RUN apt-get update && apt-get install -qy --no-install-recommends wget ca-certificates xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+RUN case "${TARGETARCH}" in \
+      amd64) FFARCH=linux64 ;; \
+      arm64) FFARCH=linuxarm64 ;; \
+      *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+  && wget -O /tmp/ffmpeg.tar.xz \
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-${FFARCH}-gpl-8.1.tar.xz" \
+  && mkdir /tmp/ffextracted \
+  && tar -xvf /tmp/ffmpeg.tar.xz -C /tmp/ffextracted --strip-components 1 \
+  && rm /tmp/ffmpeg.tar.xz
 
-# =================
-# == DIST WORKER ==
-# =================
-FROM kitware/viame:gpu-algorithms-latest as worker
-# VIAME install at /opt/noaa/viame/
-# VIAME pipelines at /opt/noaa/viame/configs/pipelines/
+FROM python:3.11-bookworm AS worker
 
-# install tini init system
-ENV TINI_VERSION v0.19.0
-ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
-RUN chmod +x /tini
-
-# Install python
-RUN export DEBIAN_FRONTEND=noninteractive && \
-  apt-get update && \
-  apt-get install -qy python3.7 libpython3.7 && \
+# install architecture-compatible tini (ffmpeg comes from BtbN stage above)
+RUN apt-get update && \
+  apt-get install -qy tini git && \
   apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# use distro-provided tini binary for current architecture
+RUN ln -sf /usr/bin/tini /tini
+
+
+
+RUN ln -fs /usr/bin/python3.11 /usr/bin/python
+WORKDIR /opt/dive/src
+
+# Use a globally accessible uv binary (works before/after USER switch)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV VIRTUAL_ENV="/opt/dive/local/venv"
+ENV UV_PROJECT_ENVIRONMENT=/opt/dive/local/venv
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+RUN uv venv /opt/dive/local/venv
+ENV PATH="/opt/dive/local/venv/bin:/usr/local/bin:$PATH"
+# Copy only the lock and project files to optimize cache
+COPY server/pyproject.toml server/uv.lock /opt/dive/src/
+# Install dependencies only
+RUN uv sync --frozen --no-install-project --no-dev
+
+# Copy full source code and install
+COPY server/ /opt/dive/src/
+    
 
 # Create user "dive" 1099:1099 to align with base image permissions.
 # https://github.com/VIAME/VIAME/blob/master/cmake/build_server_docker.sh#L123
 RUN useradd --create-home --uid 1099 --shell=/bin/bash dive
 # Create a directory for VIAME Addons
 RUN install -g dive -o dive -d /tmp/addons
+RUN chown -R dive /opt/dive/local/
 
 # Switch to the new user
 USER dive
+RUN uv sync --frozen --no-dev
 
-# Setup the path of the incoming python installation
-ENV PATH="/opt/dive/local/venv/bin:$PATH"
-
-# Copy the built python installation
-COPY --chown=dive:dive --from=server-builder /opt/dive/local/venv/ /opt/dive/local/venv/
-# Copy the source code of the editable module
-COPY --chown=dive:dive --from=server-builder /opt/dive/src /opt/dive/src
-# Copy ffmpeg
-copy --from=ffmpeg-builder /tmp/ffextracted/ffmpeg /tmp/ffextracted/ffprobe /opt/dive/local/venv/bin/
+# Copy BtbN ffmpeg/ffprobe into the path used by entrypoint_worker.sh
+RUN install -d /opt/dive/local/ffmpeg
+COPY --from=ffmpeg-builder /tmp/ffextracted/bin/ffmpeg /tmp/ffextracted/bin/ffprobe /opt/dive/local/ffmpeg/
 # Copy provision scripts
 COPY --chown=dive:dive docker/entrypoint_worker.sh /
 

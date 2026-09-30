@@ -1,10 +1,6 @@
-/// <reference types="jest" />
-import Vue from 'vue';
-import CompositionApi from '@vue/composition-api';
-import Track, { ConfidencePair, TrackData } from './track';
+import Track, { TrackData, TrackSupportedFeature } from './track';
 import { RectBounds } from './utils';
-
-Vue.use(CompositionApi);
+import { ConfidencePair } from './BaseAnnotation';
 
 describe('Track', () => {
   it('should create new instances from JSON', () => {
@@ -24,7 +20,7 @@ describe('Track', () => {
         },
       ],
       meta: {},
-      trackId: 1,
+      id: 1,
     };
     const t = Track.fromJSON(itrack);
     expect(t).toBeInstanceOf(Track);
@@ -108,7 +104,7 @@ describe('Track', () => {
         },
       ],
       meta: {},
-      trackId: 1,
+      id: 1,
     };
     const t = Track.fromJSON(itrack);
     expect(t.getType()).toEqual(['foo', 1]);
@@ -164,7 +160,7 @@ describe('Track', () => {
         },
       ],
       meta: {},
-      trackId: 0,
+      id: 0,
     };
     const track1tmpl: TrackData = {
       begin: 2,
@@ -191,7 +187,7 @@ describe('Track', () => {
         },
       ],
       meta: {},
-      trackId: 0,
+      id: 0,
     };
     const track0 = Track.fromJSON(track0tmpl);
     track0.merge([Track.fromJSON(track1tmpl)]);
@@ -205,6 +201,56 @@ describe('Track', () => {
     expect(track0.trackId).toBe(0);
     expect(track0.featureIndex.length).toBe(3);
     expect(track0.confidencePairs).toEqual([['c', 0.3], ['a', 0.2], ['b', 0.2]]);
+  });
+
+  it('merges a score-one pair without dropping other classifications', () => {
+    const receiver = new Track(1, {
+      confidencePairs: [['b', 0.4], ['a', 0.2]],
+    });
+    const source = new Track(2, {
+      confidencePairs: [['a', 1.0], ['c', 0.7]],
+    });
+    const sourceBefore = source.confidencePairs.map((pair) => [...pair]);
+
+    receiver.merge([source]);
+
+    expect(receiver.confidencePairs).toEqual([
+      ['a', 1.0],
+      ['c', 0.7],
+      ['b', 0.4],
+    ]);
+    expect(source.confidencePairs).toEqual(sourceBefore);
+    receiver.confidencePairs.forEach((pair) => expect(source.confidencePairs).not.toContain(pair));
+  });
+
+  it('splits classifications into independent vectors and tuples', () => {
+    const source = Track.fromJSON({
+      id: 1,
+      begin: 0,
+      end: 10,
+      attributes: {},
+      confidencePairs: [['a', 0.8], ['b', 0.2]],
+      features: [
+        { frame: 0, bounds: [0, 0, 1, 1] },
+        { frame: 10, bounds: [10, 10, 1, 1] },
+      ],
+    });
+
+    const [left, right] = source.split(5, 2, 3);
+
+    expect(left.confidencePairs).toEqual(source.confidencePairs);
+    expect(right.confidencePairs).toEqual(source.confidencePairs);
+    expect(left.confidencePairs).not.toBe(source.confidencePairs);
+    expect(right.confidencePairs).not.toBe(source.confidencePairs);
+    expect(left.confidencePairs).not.toBe(right.confidencePairs);
+    left.confidencePairs.forEach((pair) => {
+      expect(source.confidencePairs).not.toContain(pair);
+      expect(right.confidencePairs).not.toContain(pair);
+    });
+
+    left.setType('a', 0.4);
+    expect(source.confidencePairs).toEqual([['a', 0.8], ['b', 0.2]]);
+    expect(right.confidencePairs).toEqual([['a', 0.8], ['b', 0.2]]);
   });
   it('toggleInterpolation(frame) and toggleKeyframe(frame)', () => {
     const itrack: TrackData = {
@@ -226,7 +272,7 @@ describe('Track', () => {
         },
       ],
       meta: {},
-      trackId: 1,
+      id: 1,
     };
     const t = Track.fromJSON(itrack);
     t.toggleInterpolation(9);
@@ -282,29 +328,29 @@ describe('Track', () => {
   });
 });
 
-describe('trackExceedsThreshold', () => {
+describe('exceedsThreshold', () => {
   it('correctly determine if a confidence pair set exceeds any thresholds', () => {
     const pairs: ConfidencePair[] = [
       ['foo', 0.05],
       ['bar', 0.1],
       ['baz', 0.1000001],
     ];
-    expect(Track.trackExceedsThreshold(pairs, {
+    expect(Track.exceedsThreshold(pairs, {
       default: 0.1,
     })).toEqual([
       ['bar', 0.1],
       ['baz', 0.1000001],
     ]);
-    expect(Track.trackExceedsThreshold(pairs, {
+    expect(Track.exceedsThreshold(pairs, {
       default: 2,
     })).toEqual([]);
-    expect(Track.trackExceedsThreshold(pairs, {
+    expect(Track.exceedsThreshold(pairs, {
       default: 0.1,
       baz: 0.2,
     })).toEqual([
       ['bar', 0.1],
     ]);
-    expect(Track.trackExceedsThreshold(pairs, {
+    expect(Track.exceedsThreshold(pairs, {
       bar: 0.2,
     })).toEqual([
       ['foo', 0.05],
@@ -312,8 +358,88 @@ describe('trackExceedsThreshold', () => {
     ]);
   });
   it('other edge cases', () => {
-    expect(Track.trackExceedsThreshold([], {})).toEqual([]);
-    expect(Track.trackExceedsThreshold([['foo', 1]], {})).toEqual([['foo', 1]]);
-    expect(Track.trackExceedsThreshold([['foo', 0]], {})).toEqual([['foo', 0]]);
+    expect(Track.exceedsThreshold([], {})).toEqual([]);
+    expect(Track.exceedsThreshold([['foo', 1]], {})).toEqual([['foo', 1]]);
+    expect(Track.exceedsThreshold([['foo', 0]], {})).toEqual([['foo', 0]]);
+    expect(Track.exceedsThreshold([['foo', 0]], { default: 0.1, foo: 0 }))
+      .toEqual([['foo', 0]]);
+    expect(Track.exceedsThreshold([['fish', 0.4]], { default: 0.5, fish: 0.3 }))
+      .toEqual([['fish', 0.4]]);
+  });
+});
+
+describe('fromJSON full-box polygon cleanup', () => {
+  const base = {
+    attributes: {},
+    begin: 0,
+    end: 0,
+    confidencePairs: [['seal', 0.9]] as ConfidencePair[],
+    meta: {},
+    id: 7,
+  };
+  const boxPoly: GeoJSON.Feature<TrackSupportedFeature> = {
+    type: 'Feature',
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+    },
+    properties: { key: '' },
+  };
+  const realPoly: GeoJSON.Feature<TrackSupportedFeature> = {
+    type: 'Feature',
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[[2, 2], [8, 2], [5, 8], [2, 2]]],
+    },
+    properties: { key: '' },
+  };
+
+  it('drops a polygon that is just the full detection box', () => {
+    const track = Track.fromJSON({
+      ...base,
+      features: [{
+        frame: 0,
+        bounds: [0, 0, 10, 10] as RectBounds,
+        keyframe: true,
+        interpolate: false,
+        geometry: { type: 'FeatureCollection', features: [boxPoly] },
+      }],
+    });
+    expect(track.features[0].geometry).toBeUndefined();
+  });
+
+  it('keeps polygons that differ from the box', () => {
+    const track = Track.fromJSON({
+      ...base,
+      features: [{
+        frame: 0,
+        bounds: [0, 0, 10, 10] as RectBounds,
+        keyframe: true,
+        interpolate: false,
+        geometry: { type: 'FeatureCollection', features: [realPoly] },
+      }],
+    });
+    expect(track.features[0].geometry?.features).toHaveLength(1);
+  });
+
+  it('keeps other geometry while dropping the full-box polygon', () => {
+    const head: GeoJSON.Feature<TrackSupportedFeature> = {
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [1, 1] },
+      properties: { key: 'head' },
+    };
+    const track = Track.fromJSON({
+      ...base,
+      features: [{
+        frame: 0,
+        bounds: [0, 0, 10, 10] as RectBounds,
+        keyframe: true,
+        interpolate: false,
+        geometry: { type: 'FeatureCollection', features: [boxPoly, head] },
+      }],
+    });
+    const kept = track.features[0].geometry?.features || [];
+    expect(kept).toHaveLength(1);
+    expect(kept[0].geometry.type).toBe('Point');
   });
 });

@@ -1,12 +1,11 @@
 /*eslint class-methods-use-this: "off"*/
-import Vue from 'vue';
-import { Ref } from '@vue/composition-api';
+import Vue, { Ref } from 'vue';
 
 import { MediaController } from '../components/annotators/mediaControllerType';
-import { StateStyles, TypeStyling } from '../use/useStyling';
+import { applyHomography, Matrix3 } from '../alignedView/homography';
+import { StateStyles, TypeStyling } from '../StyleManager';
 import { FrameDataTrack } from './LayerTypes';
 
-// eslint-disable-next-line max-len
 export type StyleFunction<T, D> = T | ((point: [number, number], index: number, data: D) => T | undefined);
 export type ObjectFunction<T, D> = T | ((data: D, index: number) => T | undefined);
 export type PointFunction<T, D> = T | ((data: D) => T | undefined);
@@ -21,9 +20,13 @@ export interface LayerStyle<D> {
   position?: (point: [number, number]) => { x: number; y: number };
   color?: (data: D) => string;
   textOpacity?: (data: D) => number;
+  fontSize?: (data: D) => string | undefined;
   offset?: (data: D) => { x: number; y: number };
+  rotation?: (data: D) => number;
   fill?: ObjectFunction<boolean, D> | boolean;
   radius?: PointFunction<number, D> | number;
+  textAlign?: ((data: D) => string) | string;
+  textScaled?: ((data: D) => number | undefined) | number | undefined;
   [x: string]: unknown;
 }
 
@@ -47,69 +50,145 @@ export interface BaseLayerParams {
 }
 
 export default abstract class BaseLayer<D> {
-    formattedData: D[];
+  formattedData: D[];
 
-    annotator: MediaController;
+  annotator: MediaController;
 
-    stateStyling: StateStyles;
+  stateStyling: StateStyles;
 
-    style: LayerStyle<D>;
+  style: LayerStyle<D>;
 
-    typeStyling: Ref<TypeStyling>;
+  typeStyling: Ref<TypeStyling>;
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    featureLayer: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  featureLayer: any;
 
-    selectedIndex: number[]; // sparse array
+  selectedIndex: number[]; // sparse array
 
-    bus: Vue;
+  bus: Vue;
 
-    constructor({
-      annotator,
-      stateStyling,
-      typeStyling,
-    }: BaseLayerParams) {
-      this.annotator = annotator;
-      this.stateStyling = stateStyling;
-      this.typeStyling = typeStyling;
-      this.formattedData = [];
-      this.style = {};
-      this.featureLayer = null;
-      this.selectedIndex = [];
-      this.bus = new Vue();
-      this.initialize();
+  /**
+   * Draw-time display transform (native image space -> aligned/reference
+   * space), set while the multicam aligned view warps this camera's display.
+   * Stored annotation geometry always stays native (decision D3); the layers
+   * apply this only in their geojs `position` accessors, so rendered
+   * geometry lands on the warped imagery. Null (the default) keeps behavior
+   * byte-identical to an unwarped viewer.
+   */
+  private displayTransform: Matrix3 | null = null;
+
+  constructor({
+    annotator,
+    stateStyling,
+    typeStyling,
+  }: BaseLayerParams) {
+    this.annotator = annotator;
+    this.stateStyling = stateStyling;
+    this.typeStyling = typeStyling;
+    this.formattedData = [];
+    this.style = {};
+    this.featureLayer = null;
+    this.selectedIndex = [];
+    this.bus = new Vue();
+    this.initialize();
+  }
+
+  initialize() {
+    this.style = this.createStyle();
+    const style = {
+      ...{
+        stroke: true,
+        uniformPolygon: true,
+        strokeColor: this.stateStyling.standard && this.stateStyling.standard.color,
+        strokeWidth: 1,
+        fill: false,
+      },
+      ...this.style,
+    };
+    if (this.featureLayer && this.featureLayer.style) {
+      this.featureLayer.style(style);
     }
+  }
 
-    initialize() {
-      this.style = this.createStyle();
-      const style = {
-        ...{
-          stroke: true,
-          uniformPolygon: true,
-          strokeColor: this.stateStyling.standard && this.stateStyling.standard.color,
-          strokeWidth: 1,
-          fill: false,
-        },
-        ...this.style,
-      };
-      if (this.featureLayer && this.featureLayer.style) {
-        this.featureLayer.style(style);
+  /**
+   * geoJS features can outlive their map/renderer briefly during teardown.
+   * Detect that state so redraw callers can no-op instead of throwing.
+   */
+  protected hasRenderableFeatureLayer(): boolean {
+    if (!this.annotator.geoViewerRef?.value || !this.featureLayer) {
+      return false;
+    }
+    try {
+      const parentLayer = this.featureLayer.layer?.();
+      if (!parentLayer) {
+        return false;
       }
+      const map = parentLayer.map?.();
+      if (!map) {
+        return false;
+      }
+      const renderer = parentLayer.renderer?.();
+      if (!renderer) {
+        return false;
+      }
+      if (typeof renderer.api === 'function' && !renderer.api()) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
     }
+  }
 
     abstract redraw(): void;
 
-    changeData(frameData: FrameDataTrack[]) {
-      this.formattedData = this.formatData(frameData);
-      this.redraw();
+    /**
+     * Set (or clear) the aligned-view display transform. Callers must
+     * trigger a data refresh afterwards so geojs re-evaluates positions.
+     */
+    setDisplayTransform(matrix: Matrix3 | null) {
+      this.displayTransform = matrix;
     }
 
-    abstract formatData(frameData: FrameDataTrack[]): D[];
+    /** Map a native-space vertex into display space (identity when unwarped). */
+    protected transformPoint(point: [number, number]): { x: number; y: number } {
+      if (!this.displayTransform) {
+        return { x: point[0], y: point[1] };
+      }
+      const [x, y] = applyHomography(this.displayTransform, point);
+      return { x, y };
+    }
+
+    /** Map a native-space `{x, y}` datum into display space (identity when unwarped). */
+    protected transformXY(data: { x: number; y: number }): { x: number; y: number } {
+      if (!this.displayTransform) {
+        return { x: data.x, y: data.y };
+      }
+      const [x, y] = applyHomography(this.displayTransform, [data.x, data.y]);
+      return { x, y };
+    }
+
+    changeData(frameData: FrameDataTrack[], comparisons: string[] = []) {
+      this.formattedData = this.formatData(frameData, comparisons);
+      if (!this.hasRenderableFeatureLayer()) {
+        return;
+      }
+      // Guard above handles normal teardown; this catches races between the
+      // guard and draw on the same tick.
+      try {
+        this.redraw();
+      } catch (err) {
+        console.warn('Annotation layer redraw skipped after map/renderer teardown');
+      }
+    }
+
+    abstract formatData(frameData: FrameDataTrack[], comparisons: string[]): D[];
 
     createStyle(): LayerStyle<D> {
       return {
         strokeColor: 'black',
         strokeWidth: 1.0,
+        antialiasing: 0,
       };
     }
 }

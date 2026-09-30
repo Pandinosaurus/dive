@@ -1,7 +1,7 @@
 <script lang="ts">
 import {
   ref, Ref, watch, nextTick, defineComponent,
-} from '@vue/composition-api';
+} from 'vue';
 
 export default defineComponent({
   name: 'Prompt',
@@ -99,9 +99,12 @@ export default defineComponent({
 <template>
   <v-dialog
     v-model="show"
-    max-width="400"
+    max-width="560"
+    :z-index="1000"
   >
     <v-card>
+      <!-- Vuetify's v-card-title defaults to word-break: break-all, which
+        splits words (e.g. long pipeline names) mid-word across lines. -->
       <v-card-title
         v-if="title"
         v-mousetrap="[
@@ -110,13 +113,15 @@ export default defineComponent({
           { bind: 'enter', handler: () => select(), disable: !show },
         ]"
         class="title"
+        style="word-break: normal;"
       >
         {{ title }}
       </v-card-title>
       <v-card-text v-if="Array.isArray(text)">
         <div
-          v-for="(item,key) in text"
+          v-for="(item, key) in text"
           :key="key"
+          :class="{ 'prompt-blank-line': !item }"
         >
           {{ item }}
         </div>
@@ -127,7 +132,7 @@ export default defineComponent({
       <v-card-actions>
         <v-spacer />
         <v-btn
-          v-if="confirm"
+          v-if="confirm && negativeButton && negativeButton.length"
           ref="negative"
           text
           @click="clickNegative"
@@ -146,3 +151,9 @@ export default defineComponent({
     </v-card>
   </v-dialog>
 </template>
+
+<style scoped>
+.prompt-blank-line {
+  height: 1em;
+}
+</style>

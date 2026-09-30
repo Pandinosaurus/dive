@@ -5,8 +5,7 @@
  * Recipes can be activated by hotkeys or UI externally.
  * Recipes will usually deactivate themselves when the recipe is complete.
  */
-import Vue from 'vue';
-import { Ref } from '@vue/composition-api';
+import { Ref } from 'vue';
 
 import { Mousetrap } from './types';
 import Track from './track';
@@ -17,7 +16,7 @@ export interface UpdateResponse {
     string,
     GeoJSON.Feature<GeoJSON.Point | GeoJSON.Polygon | GeoJSON.LineString>[]
   >;
-  union: GeoJSON.Polygon[];
+  union: GeoJSON.Polygon[] | [];
   unionWithoutBounds: GeoJSON.Polygon[];
   done?: boolean;
   newType?: EditAnnotationTypes;
@@ -29,6 +28,8 @@ interface Recipe {
   icon: Ref<string>;
   active: Ref<boolean>;
   toggleable: Ref<boolean>;
+  /** Whether the recipe is currently loading (e.g., initializing models) */
+  loading?: Ref<boolean>;
   bus: Vue;
   update: (
     mode: 'in-progress' | 'editing',
@@ -53,7 +54,8 @@ interface Recipe {
   activate: () => unknown;
   mousetrap: () => Mousetrap[];
   deactivate: () => void;
+  /** Optional method to confirm/lock the current annotation (e.g., for segmentation) */
+  confirm?: () => void;
 }
-
 
 export default Recipe;

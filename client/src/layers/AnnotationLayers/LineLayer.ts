@@ -1,4 +1,5 @@
 /* eslint-disable class-methods-use-this */
+import geo, { GeoEvent } from 'geojs';
 import { cloneDeep } from 'lodash';
 
 import BaseLayer, { LayerStyle, BaseLayerParams } from '../BaseLayer';
@@ -8,11 +9,10 @@ interface LineGeoJSData{
   trackId: number;
   selected: boolean;
   editing: boolean | string;
-  trackType: [string, number] | null;
+  styleType: [string, number] | null;
   line: GeoJSON.LineString;
   dashed?: boolean;
 }
-
 
 export default class LineLayer extends BaseLayer<LineGeoJSData> {
   constructor(params: BaseLayerParams) {
@@ -25,7 +25,25 @@ export default class LineLayer extends BaseLayer<LineGeoJSData> {
     const layer = this.annotator.geoViewerRef.value.createLayer('feature', {
       features: ['point', 'line'],
     });
-    this.featureLayer = layer.createFeature('line');
+    this.featureLayer = layer
+      .createFeature('line', { selectionAPI: true })
+      .geoOn(geo.event.feature.mouseclick, (e: GeoEvent) => {
+        if (e.mouse.buttonsDown.left) {
+          if (!e.data.editing || (e.data.editing && !e.data.selected)) {
+            this.bus.$emit('annotation-clicked', e.data.trackId, false);
+          }
+        } else if (e.mouse.buttonsDown.right) {
+          if (!e.data.editing || (e.data.editing && !e.data.selected)) {
+            this.bus.$emit('annotation-right-clicked', e.data.trackId, true);
+          } else {
+            this.bus.$emit('edited-annotation-right-clicked', e.data.trackId);
+          }
+        }
+      });
+    this.featureLayer.geoOn(
+      geo.event.feature.mouseclick_order,
+      this.featureLayer.mouseOverOrderHighestIndex,
+    );
     super.initialize();
   }
 
@@ -59,20 +77,20 @@ export default class LineLayer extends BaseLayer<LineGeoJSData> {
     return dashed;
   }
 
-  formatData(frameData: FrameDataTrack[]) {
+  formatData(frameDataTracks: FrameDataTrack[]) {
     const arr: LineGeoJSData[] = [];
-    frameData.forEach((track: FrameDataTrack) => {
-      if (track.features && track.features.bounds) {
-        if (track.features.geometry?.features?.[0]) {
-          track.features.geometry.features.forEach((feature) => {
+    frameDataTracks.forEach((frameData: FrameDataTrack) => {
+      if (frameData.features && frameData.features.bounds) {
+        if (frameData.features.geometry?.features?.[0]) {
+          frameData.features.geometry.features.forEach((feature) => {
             if (feature.geometry && feature.geometry.type === 'LineString') {
               const line = cloneDeep(feature.geometry);
               // line.coordinates = LineLayer.dashLine(line.coordinates);
               const annotation: LineGeoJSData = {
-                trackId: track.trackId,
-                selected: track.selected,
-                editing: track.editing,
-                trackType: track.trackType,
+                trackId: frameData.track.id,
+                selected: frameData.selected,
+                editing: frameData.editing,
+                styleType: frameData.styleType,
                 line,
                 dashed: true,
               };
@@ -102,31 +120,31 @@ export default class LineLayer extends BaseLayer<LineGeoJSData> {
     return {
       ...super.createStyle(),
       // Style conversion to get array objects to work in geoJS
-      position: (point) => ({ x: point[0], y: point[1] }),
+      position: (point) => this.transformPoint(point),
       strokeColor: (_point, _index, data) => {
         if (data.selected) {
           return this.stateStyling.selected.color;
         }
-        if (data.trackType) {
-          return this.typeStyling.value.color(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.color(data.styleType[0]);
         }
         return this.typeStyling.value.color('');
       },
       fill: (data) => {
-        if (data.trackType) {
-          return this.typeStyling.value.fill(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.fill(data.styleType[0]);
         }
         return this.stateStyling.standard.fill;
       },
       fillColor: (_point, _index, data) => {
-        if (data.trackType) {
-          return this.typeStyling.value.color(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.color(data.styleType[0]);
         }
         return this.typeStyling.value.color('');
       },
       fillOpacity: (_point, _index, data) => {
-        if (data.trackType) {
-          return this.typeStyling.value.opacity(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.opacity(data.styleType[0]);
         }
         return this.stateStyling.standard.opacity;
       },
@@ -137,8 +155,8 @@ export default class LineLayer extends BaseLayer<LineGeoJSData> {
         if (data.selected) {
           return this.stateStyling.selected.opacity;
         }
-        if (data.trackType) {
-          return this.typeStyling.value.opacity(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.opacity(data.styleType[0]);
         }
 
         return this.stateStyling.standard.opacity;
@@ -148,8 +166,8 @@ export default class LineLayer extends BaseLayer<LineGeoJSData> {
         if (data.selected) {
           return this.stateStyling.selected.strokeWidth;
         }
-        if (data.trackType) {
-          return this.typeStyling.value.strokeWidth(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.strokeWidth(data.styleType[0]);
         }
         return this.stateStyling.standard.strokeWidth;
       },

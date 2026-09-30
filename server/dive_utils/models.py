@@ -1,9 +1,11 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from bson.objectid import ObjectId
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, StrictStr, validator
 from typing_extensions import Literal
+
+from dive_utils import constants, types
 
 
 class PydanticObjectId(str):
@@ -27,7 +29,8 @@ class GeoJSONGeometry(BaseModel):
 class GeoJSONFeature(BaseModel):
     type: str
     geometry: GeoJSONGeometry
-    properties: Dict[str, Union[bool, float, str]]
+    # str first in the Union to keep numeric strings like "1" from coercing to bool/float
+    properties: Dict[str, Union[str, float, bool]]
 
 
 class GeoJSONFeatureCollection(BaseModel):
@@ -41,29 +44,64 @@ class Feature(BaseModel):
     frame: int
     flick: Optional[int]
     bounds: List[int]
-    attributes: Optional[Dict[str, Union[bool, float, str]]]
+    attributes: Optional[Dict[str, Any]] = {}
     geometry: Optional[GeoJSONFeatureCollection] = None
     head: Optional[Tuple[float, float]] = None
     tail: Optional[Tuple[float, float]] = None
     fishLength: Optional[float] = None
     interpolate: Optional[bool] = None
     keyframe: Optional[bool] = None
+    notes: Optional[List[str]] = None
 
 
-class Track(BaseModel):
-    begin: int
-    end: int
-    trackId: int
-    features: List[Feature] = Field(default_factory=lambda: [])
+class BaseAnnotation(BaseModel):
+    begin: Optional[int]
+    end: Optional[int]
+    id: int
     confidencePairs: List[Tuple[str, float]] = Field(default_factory=lambda: [])
     attributes: Dict[str, Any] = Field(default_factory=lambda: {})
     meta: Optional[Dict[str, Any]]
+
+    def exceeds_thresholds(self, thresholds: Dict[str, float], typeFilter: Set[str] = None) -> bool:
+        defaultThresh = thresholds.get('default', 0)
+
+        # Check if there is any confidence value that exceeds the threshold
+        exceeds_default_threshold = False
+        for field, confidence in self.confidencePairs:
+            if confidence >= thresholds.get(field, defaultThresh):
+                if (
+                    typeFilter and field in typeFilter
+                ):  # field is in the set and confidence > threshold
+                    exceeds_default_threshold = True
+                elif (
+                    typeFilter
+                ):  # if typeFilter has a set and the field isn't in it we return false
+                    exceeds_default_threshold = False
+                elif (
+                    not typeFilter
+                ):  # if no typeFilter we return true based on confidence > threshold
+                    exceeds_default_threshold = True
+            else:
+                exceeds_default_threshold = False
+            if exceeds_default_threshold:
+                return True
+
+        return False
+
+    def __hash__(self):
+        return self.id
+
+
+class Track(BaseAnnotation):
+    begin: int
+    end: int
+    features: List[Feature] = Field(default_factory=lambda: [])
 
     @validator('features')
     @classmethod
     def validateFeatures(cls, v: List[Feature], values: dict):
         if len(v) > 0:
-            trackId = values.get('trackId')
+            trackId = values.get('id')
             begin = values.get('begin')
             end = values.get('end')
             if v[0].frame != begin:
@@ -76,21 +114,27 @@ class Track(BaseModel):
                 )
         return v
 
-    def exceeds_thresholds(self, thresholds: Dict[str, float]) -> bool:
-        defaultThresh = thresholds.get('default', 0)
-        return any(
-            [
-                confidence >= thresholds.get(field, defaultThresh)
-                for field, confidence in self.confidencePairs
-            ]
-        )
 
-    def __hash__(self):
-        return self.trackId
+class GroupMember(BaseModel):
+    ranges: List[List[int]]
 
 
-class AnnotationItemSchema(Track):
+class Group(BaseAnnotation):
+    # Mongo keys must be strings, but the members key is an int.
+    # The client is responsible for converting it.
+    members: Dict[str, GroupMember]
+
+
+class TrackItemSchema(Track):
     dataset: PydanticObjectId
+    set: Optional[str]
+    rev_created: int = 0
+    rev_deleted: Optional[int]
+
+
+class GroupItemSchema(Group):
+    dataset: PydanticObjectId
+    set: Optional[str]
     rev_created: int = 0
     rev_deleted: Optional[int]
 
@@ -104,14 +148,57 @@ class RevisionLog(BaseModel):
     deletions: int = 0
     created: datetime = Field(default_factory=datetime.utcnow)
     description: Optional[str]
+    set: Optional[str]
+
+
+class NumericAttributeOptions(BaseModel):
+    type: Literal['combo', 'slider']
+    range: Optional[List[float]]
+    steps: Optional[float]
+
+
+class StringAttributeOptions(BaseModel):
+    type: Literal['locked', 'freeform']
+
+
+class RenderingDisplayDimension(BaseModel):
+    type: Literal['px', '%', 'auto']
+    val: float
+
+
+class RenderingAttributes(BaseModel):
+    typeFilter: List[str]
+    selected: Optional[bool]
+    hideEmpty: Optional[bool]
+    displayName: str
+    displayColor: str
+    displayTextSize: float
+    valueColor: str
+    valueTextSize: float
+    order: int
+    location: Literal['inside', 'outside']
+    corner: Optional[Literal['SW', 'SE', 'NW']]
+    box: bool
+    boxColor: str
+    boxThickness: float
+    boxBackground: Optional[str]
+    boxOpacity: Optional[float]
+    layout: Literal['vertical', 'horizontal']
+    displayWidth: RenderingDisplayDimension
+    displayHeight: RenderingDisplayDimension
 
 
 class Attribute(BaseModel):
     belongs: Literal['track', 'detection']
     datatype: Literal['text', 'number', 'boolean']
     values: Optional[List[str]]
+    valueColors: Optional[Dict[str, str]]
     name: str
     key: str
+    color: Optional[str]
+    user: Optional[bool]
+    editor: Optional[Union[NumericAttributeOptions, StringAttributeOptions]]
+    render: Optional[RenderingAttributes]
 
 
 class CustomStyle(BaseModel):
@@ -123,27 +210,162 @@ class CustomStyle(BaseModel):
     showConfidence: Optional[bool]
 
 
+class AttributeMatch(BaseModel):
+    op: Optional[Literal['=', '≠', '>', '<', '>=', '<=', 'range', 'in', 'rangeFilter', 'contains']]
+    val: Any
+    userDefined: Optional[bool]
+    range: Optional[List[float]]
+
+
+class AttributeTrackFilter(BaseModel):
+    typeFilter: Optional[List[str]]
+    name: str
+    attribute: str
+    type: Literal['track', 'detection']
+    ignoreUndefined: Optional[bool]
+    filter: AttributeMatch
+    enabled: Optional[bool]
+    primaryDisplay: Optional[bool]
+
+
+class CorrespondencePoint(BaseModel):
+    id: int
+    a: Tuple[float, float]
+    b: Tuple[float, float]
+
+
+class CameraObservation(BaseModel):
+    """The correspondence points contributed by one image pair of a camera
+    pair (registration format v2). The image names are the identity; ``frame``
+    is a dataset-local index the client re-resolves from them at load time.
+    ``source`` is the producer id ('manual' for hand-picked, else a matcher
+    id like 'minima_loftr'); ``stats`` are free-form producer quality
+    statistics preserved verbatim.
+    """
+
+    imageA: str
+    imageB: str
+    frame: Optional[int]
+    enabled: bool = True
+    source: str = 'manual'
+    stats: Optional[Dict[str, Any]]
+    points: List[CorrespondencePoint]
+
+
+class PairHomography(BaseModel):
+    AtoB: List[List[float]]
+    BtoA: List[List[float]]
+
+
+CameraTransformType = Literal['translation', 'rigid', 'similarity', 'affine', 'homography']
+TypeHierarchy = Dict[StrictStr, StrictStr]
+
+# Sensor modality of a multicam camera; see dive_tasks.multicam_pipeline.CAMERA_ROLE_ALIASES.
+CameraRole = Literal['eo', 'ir', 'uv']
+
+
+class TaxonomySource(BaseModel):
+    aphiaId: int
+    scientificName: StrictStr
+    rank: StrictStr
+
+
 class MetadataMutable(BaseModel):
-    version = 1  # maintain compatibility with desktop for the subset of fields that overlap.
+    version = (
+        constants.JsonMetaCurrentVersion
+    )  # maintain compatibility with desktop for the subset of fields that overlap.
     customTypeStyling: Optional[Dict[str, CustomStyle]]
+    customGroupStyling: Optional[Dict[str, CustomStyle]]
     confidenceFilters: Optional[Dict[str, float]]
+    timeFilters: Optional[List[int]]
+    imageEnhancements: Optional[Dict[str, Any]]
     attributes: Optional[Dict[str, Attribute]]
+    attributeTrackFilters: Optional[Dict[str, AttributeTrackFilter]]
+    datasetInfo: Optional[types.DatasetInfo]
+    typeHierarchy: Optional[TypeHierarchy] = None
+    taxonomySources: Optional[Dict[str, TaxonomySource]] = None
+    # Per-camera-pair alignment homographies, keyed by directional "left::right".
+    # Each value holds the 3x3 AtoB / BtoA matrices.
+    cameraHomographies: Optional[Dict[str, PairHomography]]
+    # The per-image-pair correspondence observations behind those homographies,
+    # keyed the same way. Each entry lists the observations (image-pair
+    # identity, enabled flag, producer source, stats, and points) that pool
+    # into that pair's fit.
+    cameraCorrespondences: Optional[Dict[str, List[CameraObservation]]]
+    # The fit model used to compute each pair's homography (translation / rigid /
+    # similarity / affine / homography), keyed the same way. Missing entries
+    # default to 'similarity' client-side.
+    cameraTransformTypes: Optional[Dict[str, CameraTransformType]]
+    # Free-form producer provenance for the camera calibration (e.g. an external
+    # model step's version / swathe / generation time). Never interpreted by
+    # DIVE; preserved verbatim so refined calibrations can be traced back to the
+    # model version they were made against.
+    cameraRegistrationSource: Optional[Dict[str, Any]]
+    # Sensor role per multicam camera name, inferred at import from the camera
+    # and image names and editable afterwards; used to place cameras onto a
+    # pipeline's declared camera slots. Cameras with no known role are absent.
+    cameraRoles: Optional[Dict[str, CameraRole]]
+    fps: Optional[float]
 
     @staticmethod
     def is_dive_configuration(value: dict):
         """
         Check if value is a configuration file if at lease one of the config options is populated
         """
+        # Annotation documents may carry annotation fps alongside tracks/groups.
+        if 'tracks' in value or 'groups' in value:
+            return False
+
         keys = list(MetadataMutable.schema()['properties'].keys())
 
         # Remove version: its appearance is not enough to indicate that
         # the value is actually a configuration object.
         keys.remove("version")
 
-        return any([value.get(key, False) for key in keys])
+        return 'typeHierarchy' in value or any([value.get(key, False) for key in keys])
+
+
+class MediaResource(BaseModel):
+    url: str
+    id: str
+    filename: str
+
+
+class MultiCamCameraMeta(BaseModel):
+    """Per-camera entry stored on the parent folder meta.multiCam.cameras."""
+
+    folderId: str
+    type: str
+
+
+class MultiCamMetaStorage(BaseModel):
+    """Parent-folder multiCam metadata (storage shape)."""
+
+    defaultDisplay: str
+    cameras: Dict[str, MultiCamCameraMeta]
+    cameraOrder: List[str] = Field(default_factory=list)
+    calibrationItemId: Optional[str] = None
+    jsonCalibrationItemId: Optional[str] = None
+    calibrationOriginalName: Optional[str] = None
+
+
+class MultiCamMediaCamera(BaseModel):
+    """Per-camera media returned to the client (matches dive-common MultiCamMedia)."""
+
+    type: str
+    imageData: List[MediaResource] = Field(default_factory=list)
+    videoUrl: str = ''
+
+
+class MultiCamMedia(BaseModel):
+    cameras: Dict[str, MultiCamMediaCamera]
+    defaultDisplay: str
+    cameraOrder: List[str] = Field(default_factory=list)
 
 
 class GirderMetadataStatic(MetadataMutable):
+    # Reads preserve legacy malformed storage so the viewer can report and repair it.
+    typeHierarchy: Optional[Any] = None
     # Required
     id: str
     name: str
@@ -158,17 +380,19 @@ class GirderMetadataStatic(MetadataMutable):
     originalFps: Optional[Union[float, int]]
     ffprobe_info: Optional[Dict[str, Any]]
     foreign_media_id: Optional[str]
-
-
-class MediaResource(BaseModel):
-    url: str
-    id: str
-    filename: str
+    subType: Optional[Literal['stereo', 'multicam']] = None
+    multiCamMedia: Optional[MultiCamMedia] = None
+    # Optional per-dataset metadata file (folder meta; mirrors calibrationItemId
+    # / calibrationOriginalName on multiCam). Must be declared so get_dataset
+    # does not drop them when constructing from folder meta.
+    metadataFileItemId: Optional[str] = None
+    metadataFileOriginalName: Optional[str] = None
 
 
 class DatasetSourceMedia(BaseModel):
     imageData: List[MediaResource]
     video: Optional[MediaResource]
+    sourceVideo: Optional[MediaResource]
 
 
 class PrivateQueueEnabledResponse(BaseModel):
@@ -181,6 +405,11 @@ class CocoMetadata(BaseModel):
     keypoint_categories: Dict[int, dict]
     images: Dict[int, dict]
     videos: Dict[int, dict]
+    datasetInfo: types.DatasetInfo = {}
+    # KWCOCO ``prob`` arrays align positionally with the document's categories array,
+    # rather than the id-keyed category lookup above.  Keep unnamed slots so that
+    # vector length validation remains meaningful.
+    ordered_category_names: List[Optional[str]] = Field(default_factory=list)
 
 
 class BrandData(BaseModel):
@@ -190,6 +419,15 @@ class BrandData(BaseModel):
     name: Optional[str]
     loginMessage: Optional[str]
     alertMessage: Optional[str]
+    trainingMessage: Optional[str]
+
+    class Config:
+        extra = 'forbid'
+
+
+class JobsDisabledConfig(BaseModel):
+    disabled: bool = False
+    message: Optional[str] = None
 
     class Config:
         extra = 'forbid'

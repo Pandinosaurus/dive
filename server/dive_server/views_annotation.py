@@ -3,13 +3,14 @@ from typing import List, Optional
 import cherrypy
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
-from girder.api.rest import Resource
+from girder.api.rest import Resource, setRawResponse
 from girder.constants import AccessType, TokenScope
+from girder.exceptions import RestException
 from girder.models.folder import Folder
 
-from dive_utils import setContentDisposition
+from dive_utils import constants, fromMeta, setContentDisposition
 
-from . import crud, crud_annotation
+from . import crud, crud_annotation, crud_dataset
 
 DatasetModelParam = {
     'description': "dataset id",
@@ -19,6 +20,15 @@ DatasetModelParam = {
 }
 
 
+GetAnnotationParams = (
+    Description("Get annotations of a dataset")
+    .pagingParams("id", defaultLimit=0)
+    .modelParam("folderId", **DatasetModelParam, level=AccessType.READ)
+    .param('revision', 'revision', dataType='integer', required=False)
+    .param('set', 'set', dataType='string', required=False)
+)
+
+
 class AnnotationResource(Resource):
     """RESTFul Annotation Resource"""
 
@@ -26,31 +36,47 @@ class AnnotationResource(Resource):
         super(AnnotationResource, self).__init__()
         self.resourceName = resourceName
 
-        self.route("GET", (), self.get_annotations)
+        self.route("GET", ("track",), self.get_tracks)
+        self.route("GET", ("group",), self.get_groups)
         self.route("GET", ("revision",), self.get_revisions)
         self.route("GET", ("export",), self.export)
         self.route("GET", ("labels",), self.get_labels)
+        self.route("GET", ("sets",), self.get_sets)
         self.route("PATCH", (), self.save_annotations)
         self.route("POST", ("rollback",), self.rollback)
 
     @access.user
+    @autoDescribeRoute(GetAnnotationParams)
+    def get_tracks(self, limit: int, offset: int, sort, folder, revision, set):
+        return crud_annotation.TrackItem().list(
+            folder, limit=limit, offset=offset, sort=sort, revision=revision, set=set
+        )
+
+    @access.user
+    @autoDescribeRoute(GetAnnotationParams)
+    def get_groups(self, limit: int, offset: int, sort, folder, revision, set):
+        return crud_annotation.GroupItem().list(
+            folder, limit=limit, offset=offset, sort=sort, revision=revision, set=set
+        )
+
+    @access.user
     @autoDescribeRoute(
-        Description("Get annotations of a dataset")
-        .pagingParams("trackId", defaultLimit=0)
+        Description("Get dataset annotation revision log")
+        .pagingParams("revision", defaultLimit=20)
         .modelParam("folderId", **DatasetModelParam, level=AccessType.READ)
-        .param('revision', 'revision', dataType='integer', required=False)
         .param(
-            'contentDisposition',
-            "inline or attachment",
-            enum=['inline', 'attachment'],
-            default='inline',
+            "set",
+            "Custom set name for any annotations that are loaded",
+            paramType="query",
+            dataType="string",
+            default='',
+            required=False,
         )
     )
-    def get_annotations(self, limit: int, offset: int, sort, folder, revision, contentDisposition):
-        setContentDisposition(
-            f'{folder["name"]}.dive.json', mime='text/csv', disposition=contentDisposition
+    def get_revisions(self, limit: int, offset: int, sort, folder, set):
+        cursor, total = crud_annotation.RevisionLogItem().list(
+            folder, limit, offset, sort, None, set
         )
-        cursor, total = crud_annotation.get_annotations(folder, limit, offset, sort, revision)
         cherrypy.response.headers['Girder-Total-Count'] = total
         return cursor
 
@@ -60,9 +86,8 @@ class AnnotationResource(Resource):
         .pagingParams("revision", defaultLimit=20)
         .modelParam("folderId", **DatasetModelParam, level=AccessType.READ)
     )
-    def get_revisions(self, limit: int, offset: int, sort, folder):
-        cursor, total = crud_annotation.get_revisions(folder, limit, offset, sort)
-        cherrypy.response.headers['Girder-Total-Count'] = total
+    def get_sets(self, limit: int, offset: int, sort, folder):
+        cursor = crud_annotation.RevisionLogItem().sets(folder, limit, offset, sort)
         return cursor
 
     @access.public(scope=TokenScope.DATA_READ, cookie=True)
@@ -71,45 +96,124 @@ class AnnotationResource(Resource):
         .modelParam("folderId", **DatasetModelParam, level=AccessType.READ)
         .param(
             "excludeBelowThreshold",
-            "Exclude tracks with confidencePairs below set threshold",
+            "Exclude tracks with confidencePairs below set threshold.",
             paramType="query",
             dataType="boolean",
             default=False,
         )
+        .param(
+            "revisionId",
+            "Optional revision to export from.  Default is latest.",
+            paramType="query",
+            dataType="integer",
+            default=None,
+            required=False,
+        )
+        .param(
+            'format',
+            'Optional export format.',
+            paramType='query',
+            dataType='string',
+            default='viame_csv',
+            enum=['viame_csv', 'dive_json', 'coco_json'],
+            required=False,
+        )
         .jsonParam(
             "typeFilter",
-            "List of track types to filter by",
+            "List of track types to filter by.  Default is no filtering.",
             paramType="query",
             required=False,
             default=None,
             requireArray=True,
         )
-    )
-    def export(self, folder, excludeBelowThreshold: bool, typeFilter: Optional[List[str]]):
-        crud.verify_dataset(folder)
-        filename, gen = crud_annotation.get_annotation_csv_generator(
-            folder,
-            self.getCurrentUser(),
-            excludeBelowThreshold=excludeBelowThreshold,
-            typeFilter=typeFilter,
+        .param(
+            "set",
+            "Annotation set to export (viame_csv only).  Default is the default set.",
+            paramType="query",
+            dataType="string",
+            default=None,
+            required=False,
         )
-        setContentDisposition(filename, mime='text/csv')
-        return gen
+    )
+    def export(
+        self,
+        folder,
+        excludeBelowThreshold: bool,
+        revisionId: int,
+        format: str,
+        typeFilter: Optional[List[str]],
+        set: Optional[str],
+    ):
+        crud.verify_dataset(folder)
+
+        if fromMeta(folder, constants.TypeMarker) == constants.MultiType:
+            gen = crud_dataset.export_multicam_annotations_zipstream(
+                folder,
+                self.getCurrentUser(),
+                format,
+                excludeBelowThreshold,
+                typeFilter,
+                revisionId,
+            )
+            setContentDisposition(f'{folder["name"]}.zip', mime='application/zip')
+            return gen
+
+        if format == 'viame_csv':
+            filename, gen = crud_annotation.get_annotation_csv_generator(
+                folder,
+                self.getCurrentUser(),
+                excludeBelowThreshold=excludeBelowThreshold,
+                typeFilter=typeFilter,
+                revision=revisionId,
+                set=set or None,
+            )
+            setContentDisposition(filename, mime='text/csv')
+            return gen
+        elif format == 'dive_json':
+            setContentDisposition(f'{folder["name"]}.dive.json', mime='application/json')
+            setRawResponse()
+            return crud_dataset._dive_json_export_text(
+                folder,
+                revisionId,
+                excludeBelowThreshold,
+                typeFilter,
+            ).encode('utf-8')
+        elif format == 'coco_json':
+            setContentDisposition(f'{folder["name"]}.coco.json', mime='application/json')
+            setRawResponse()
+            return crud_dataset._coco_json_export_text(
+                folder,
+                self.getCurrentUser(),
+                revisionId,
+                excludeBelowThreshold,
+                typeFilter,
+            ).encode('utf-8')
+        else:
+            raise RestException(f'Format {format} is not a valid option.')
 
     @access.user
     @autoDescribeRoute(
         Description("Update annotations")
         .modelParam("folderId", **DatasetModelParam, level=AccessType.WRITE)
-        .jsonParam("tracks", "upsert and delete tracks", paramType="body", requireObject=True)
+        .jsonParam("body", "upsert and delete tracks", paramType="body", requireObject=True)
     )
-    def save_annotations(self, folder, tracks):
+    def save_annotations(self, folder, body, set=None):
         crud.verify_dataset(folder)
         validated: crud_annotation.AnnotationUpdateArgs = crud.get_validated_model(
-            crud_annotation.AnnotationUpdateArgs, **tracks
+            crud_annotation.AnnotationUpdateArgs, **body
         )
-        upsert = [track.dict(exclude_none=True) for track in validated.upsert]
+        upsert_tracks = [track.dict(exclude_none=True) for track in validated.tracks.upsert]
+        upsert_groups = [group.dict(exclude_none=True) for group in validated.groups.upsert]
         user = self.getCurrentUser()
-        return crud_annotation.save_annotations(folder, upsert, validated.delete, user)
+        return crud_annotation.save_annotations(
+            folder,
+            user,
+            upsert_tracks=upsert_tracks,
+            delete_tracks=validated.tracks.delete,
+            upsert_groups=upsert_groups,
+            delete_groups=validated.groups.delete,
+            set=validated.set,
+        )
 
     @access.user
     @autoDescribeRoute(
@@ -122,6 +226,22 @@ class AnnotationResource(Resource):
         crud_annotation.rollback(folder, revision)
 
     @access.user
-    @autoDescribeRoute(Description("Get all labels visible to a particular user"))
-    def get_labels(self):
-        return crud_annotation.get_labels(self.getCurrentUser())
+    @autoDescribeRoute(
+        Description("Get all labels visible to a particular user")
+        .param(
+            constants.PublishedMarker,
+            'Return only labels from published data',
+            required=False,
+            default=True,
+            dataType='boolean',
+        )
+        .param(
+            constants.SharedMarker,
+            'Return only labels from data shared with me',
+            required=False,
+            default=True,
+            dataType='boolean',
+        )
+    )
+    def get_labels(self, published: bool, shared: bool):
+        return crud_annotation.get_labels(self.getCurrentUser(), published=published, shared=shared)

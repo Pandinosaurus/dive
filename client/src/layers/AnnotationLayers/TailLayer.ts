@@ -6,14 +6,14 @@
  * Track layer is a-typical because it requires extra temporal context,
  * so it cannot be based on the a-temporal BaseLayer.
  */
-import BaseLayer, { LayerStyle, BaseLayerParams, MarkerStyle } from 'vue-media-annotator/layers/BaseLayer';
-import Track, { TrackId } from 'vue-media-annotator/track';
-import { FrameDataTrack } from 'vue-media-annotator/layers/LayerTypes';
-import { getTrack } from 'vue-media-annotator/use/useTrackStore';
+import BaseLayer, { LayerStyle, BaseLayerParams, MarkerStyle } from '../BaseLayer';
+import { TrackId } from '../../track';
+import TrackStore from '../../TrackStore';
+import { FrameDataTrack } from '../LayerTypes';
 
 interface TailData {
   trackId: TrackId;
-  confidencePairs: [string, number] | null;
+  styleType: [string, number] | null;
   selected: boolean;
   t: number; // GeoJS tail data t(time)
   x: number;
@@ -32,22 +32,22 @@ export default class TailLayer extends BaseLayer<TailData[]> {
 
   markerOpacity: number;
 
-  /** Hold a reference to the trackMap */
-  trackMap: Readonly<Map<number, Track>>;
+  /** Hold a reference to the trackStore */
+  trackStore: Readonly<TrackStore>;
 
-  constructor(params: BaseLayerParams, trackMap: Readonly<Map<number, Track>>) {
+  constructor(params: BaseLayerParams, trackStore: Readonly<TrackStore>) {
     super(params);
     this.currentFrame = 0;
     this.before = 10;
     this.after = 5;
     this.markerSize = 10;
     this.markerOpacity = 1.0;
-    this.trackMap = trackMap;
+    this.trackStore = trackStore;
     this.initialize();
   }
 
   generateDataForTrack(fd: FrameDataTrack): TailData[] {
-    const track = getTrack(this.trackMap, fd.trackId);
+    const track = this.trackStore.get(fd.track.id);
     const tailData: TailData[] = [];
     let lastPoint: TailData | null = null;
     const start = Math.max(this.currentFrame - this.before, 0);
@@ -62,7 +62,7 @@ export default class TailLayer extends BaseLayer<TailData[]> {
       if (bounds) {
         const point: TailData = {
           trackId: track.trackId,
-          confidencePairs: track.getType(),
+          styleType: fd.styleType,
           selected: fd.selected,
           t: frame,
           x: bounds[0] + (bounds[2] - bounds[0]) / 2.0,
@@ -138,8 +138,8 @@ export default class TailLayer extends BaseLayer<TailData[]> {
           if (trackData[0].selected) {
             return this.stateStyling.selected.color;
           }
-          if (trackData[0].confidencePairs) {
-            return this.typeStyling.value.color(trackData[0].confidencePairs[0]);
+          if (trackData[0].styleType) {
+            return this.typeStyling.value.color(trackData[0].styleType[0]);
           }
         }
 
@@ -152,8 +152,8 @@ export default class TailLayer extends BaseLayer<TailData[]> {
           if (trackData[0].selected) {
             return this.stateStyling.selected.color;
           }
-          if (trackData[0].confidencePairs) {
-            return this.typeStyling.value.color(trackData[0].confidencePairs[0]);
+          if (trackData[0].styleType) {
+            return this.typeStyling.value.color(trackData[0].styleType[0]);
           }
         }
 
@@ -167,15 +167,13 @@ export default class TailLayer extends BaseLayer<TailData[]> {
       strokeColor: (point, _, trackData) => {
         if (trackData[0]) {
           if (trackData[0].selected) {
-            // eslint-disable-next-line @typescript-eslint/ban-ts-ignore
-            // @ts-ignore
-            if ((point as { interpolated: boolean }).interpolated) {
+            if ((point as unknown as { interpolated: boolean }).interpolated) {
               return 'yellow';
             }
             return this.stateStyling.selected.color;
           }
-          if (trackData[0].confidencePairs) {
-            return this.typeStyling.value.color(trackData[0].confidencePairs[0]);
+          if (trackData[0].styleType) {
+            return this.typeStyling.value.color(trackData[0].styleType[0]);
           }
         }
         return this.typeStyling.value.color('');

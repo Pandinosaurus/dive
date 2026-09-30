@@ -1,32 +1,38 @@
 import BaseLayer, { LayerStyle } from '../BaseLayer';
 import { FrameDataTrack } from '../LayerTypes';
+import { spineIndex } from '../../headTail';
 
 interface PointGeoJSData {
     trackId: number;
     selected: boolean;
     editing: boolean | string;
-    trackType: [string, number] | null;
+  styleType: [string, number] | null;
     feature: string;
     x: number;
     y: number;
 }
+
+const compactInterior = (data: PointGeoJSData) => spineIndex(data.feature) !== null
+  && !(data.selected && data.editing === 'LineString');
 
 export default class PointLayer extends BaseLayer<PointGeoJSData> {
   initialize() {
     const layer = this.annotator.geoViewerRef.value.createLayer('feature', {
       features: ['point'],
     });
-    this.featureLayer = layer.createFeature('point');
+    this.featureLayer = layer
+      .createFeature('point')
+      .position((data: PointGeoJSData) => this.transformXY(data));
     super.initialize();
   }
 
   // eslint-disable-next-line class-methods-use-this
-  formatData(frameData: FrameDataTrack[]): PointGeoJSData[] {
+  formatData(frameDataTracks: FrameDataTrack[]): PointGeoJSData[] {
     const arr: PointGeoJSData[] = []; //(this.checkHeadTail(frameData));
-    frameData.forEach((track: FrameDataTrack) => {
-      if (track.features && track.features.bounds) {
-        if (track.features.geometry?.features?.[0]) {
-          track.features.geometry.features.forEach((feature) => {
+    frameDataTracks.forEach((frameData: FrameDataTrack) => {
+      if (frameData.features && frameData.features.bounds) {
+        if (frameData.features.geometry?.features?.[0]) {
+          frameData.features.geometry.features.forEach((feature) => {
             if (feature.geometry && feature.geometry.type === 'Point') {
               const [x, y] = feature.geometry.coordinates;
               let key = 'point';
@@ -34,10 +40,10 @@ export default class PointLayer extends BaseLayer<PointGeoJSData> {
                 key = feature.properties.key;
               }
               const annotation: PointGeoJSData = {
-                trackId: track.trackId,
-                selected: track.selected,
-                editing: track.editing,
-                trackType: track.trackType,
+                trackId: frameData.track.id,
+                selected: frameData.selected,
+                editing: frameData.editing,
+                styleType: frameData.styleType,
                 feature: key,
                 x,
                 y,
@@ -54,34 +60,49 @@ export default class PointLayer extends BaseLayer<PointGeoJSData> {
   createStyle(): LayerStyle<PointGeoJSData> {
     return {
       ...super.createStyle(),
-      fill: (data: PointGeoJSData) => data.feature === 'head',
+      fill: (data: PointGeoJSData) => data.feature === 'head'
+        || compactInterior(data),
       fillColor: (data: PointGeoJSData) => {
-        if (data.trackType) {
-          return this.typeStyling.value.color(data.trackType[0]);
+        if (compactInterior(data) && data.selected) {
+          return this.stateStyling.selected.color;
+        }
+        if (data.styleType) {
+          return this.typeStyling.value.color(data.styleType[0]);
         }
         return this.typeStyling.value.color('');
       },
       fillOpacity: (data: PointGeoJSData) => {
-        if (data.trackType) {
-          return this.typeStyling.value.opacity(data.trackType[0]);
+        if (compactInterior(data)) return 1;
+        if (data.styleType) {
+          return this.typeStyling.value.opacity(data.styleType[0]);
         }
         return this.stateStyling.standard.opacity;
       },
       radius: (data: PointGeoJSData) => {
+        // Selection changes color, not the size of a compact interior marker.
+        if (compactInterior(data)) {
+          return data.styleType ? this.typeStyling.value.strokeWidth(data.styleType[0])
+            : this.stateStyling.standard.strokeWidth;
+        }
+        const scale = 2;
         if (data.selected) {
-          return this.stateStyling.selected.strokeWidth * 2;
+          return this.stateStyling.selected.strokeWidth * scale;
         }
-        if (data.trackType) {
-          return this.typeStyling.value.strokeWidth(data.trackType[0]) * 2;
+        if (data.styleType) {
+          return this.typeStyling.value.strokeWidth(data.styleType[0]) * scale;
         }
-        return this.stateStyling.standard.strokeWidth * 2;
+        return this.stateStyling.standard.strokeWidth * scale;
       },
       strokeWidth: (data: PointGeoJSData) => {
+        if (compactInterior(data)) {
+          return (data.styleType ? this.typeStyling.value.strokeWidth(data.styleType[0])
+            : this.stateStyling.standard.strokeWidth) / 2;
+        }
         if (data.selected) {
           return this.stateStyling.selected.strokeWidth;
         }
-        if (data.trackType) {
-          return this.typeStyling.value.strokeWidth(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.strokeWidth(data.styleType[0]);
         }
         return this.stateStyling.standard.strokeWidth;
       },
@@ -89,8 +110,8 @@ export default class PointLayer extends BaseLayer<PointGeoJSData> {
         if (data.selected) {
           return this.stateStyling.selected.color;
         }
-        if (data.trackType) {
-          return this.typeStyling.value.color(data.trackType[0]);
+        if (data.styleType) {
+          return this.typeStyling.value.color(data.styleType[0]);
         }
         return this.typeStyling.value.color('');
       },

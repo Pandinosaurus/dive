@@ -40,7 +40,10 @@
 1. For attributes there are two sections
     1. **Track Attributes** - All track level attributes
     1. **Detection Attributes** - attributes associated with the track on a per frame basis
-
+1. Attributes can be sorted by their name (alphabetically) or by their numeric value.  Clicking on the ==:material-sort-alphabetical-ascending:== or the ==:material-sort-numeric-ascending:== button will swap between the two.
+1. Attribute Filtering
+    1. The Attribute filtering icon ==:material-filter:== will change color when filtering is being applied.
+    1. Clicking on the filter icon will bring up the **[Attributes Details Panel](UI-AttributeDetails.md)**
 <div style="clear: both;"/>
 
 !!! info
@@ -84,6 +87,10 @@ Click the ==:material-cog:== button next to an existing attribute to edit its de
 1. Click on the attribute value when in viewing mode to edit and set the attribute
 1. Or directly edit the value field when in the attribute editing mode
 1. Setting an attribute to the empty value will remove the value from the track/detection
+
+### Suppression attributes
+
+If [suppression](UI-Suppression.md) is enabled, an attribute whose **name matches the Suppression Region Type** (default `Suppressed`) marks a detection or track as attribute-suppressed when set to a truthy value (`true`, `1`, `yes`, `on`, or a nonzero number). The detection stays visible with its real type, can show dashed/fill styling and an eye-off tag, and is excluded from its own type's counts. Create a Boolean track or detection attribute with that name to edit the flag in this panel.
 
 ## Importing and Exporting Attributes
 

@@ -1,4 +1,5 @@
-import { TypeStyling } from '../../use/useStyling';
+import { Ref } from 'vue';
+import { TypeStyling } from '../../StyleManager';
 import BaseLayer, { BaseLayerParams, LayerStyle } from '../BaseLayer';
 import { FrameDataTrack } from '../LayerTypes';
 
@@ -6,19 +7,28 @@ export interface TextData {
   selected: boolean;
   editing: boolean | string;
   type: string;
+  /** Suppression type name when attribute-flagged as suppressed (eye-off tag). */
+  suppressed?: string;
   confidence: number;
   text: string;
   x: number;
   y: number;
   offsetY?: number;
   offsetX?: number;
-  currentPair: boolean;
+  set?: string;
 }
 
-export type FormatTextRow = (track: FrameDataTrack, typeStyling?: TypeStyling) => TextData[] | null;
+export type FormatTextRow = (
+  annotation: FrameDataTrack,
+  typeStyling?: TypeStyling,
+  showUserCreatedIcon?: boolean,
+  showSuppressedTags?: boolean,
+) => TextData[] | null;
 
 interface TextLayerParams {
   formatter?: FormatTextRow;
+  showUserCreatedIcon?: Ref<boolean>;
+  showSuppressedTags?: Ref<boolean>;
 }
 
 /**
@@ -27,48 +37,79 @@ interface TextLayerParams {
  * @param lineHeight - height of each text line
  * @returns value or null.  null indicates that the text should not be displayed.
  */
-function defaultFormatter(
-  track: FrameDataTrack,
+export function defaultFormatter(
+  annotation: FrameDataTrack,
   typeStyling?: TypeStyling,
-  maxPairs = 1,
-  lineHeight = 20,
+  showUserCreatedIcon: boolean = true,
+  showSuppressedTags: boolean = true,
 ): TextData[] | null {
-  if (track.features && track.features.bounds) {
-    const { bounds } = track.features;
-    if (bounds && track.confidencePairs !== null) {
-      const arr: TextData[] = [];
-      const totalVisiblePairs = Math.min(track.confidencePairs.length, maxPairs);
-      for (let i = 0; i < track.confidencePairs.length; i += 1) {
-        const [type, confidence] = track.confidencePairs[i];
-        const isCurrentPair = (type === track.trackType[0]);
-        const currentTypeIndication = (isCurrentPair && totalVisiblePairs > 1) ? '**' : '';
-        let text = '';
-        if (typeStyling) {
-          const { showLabel, showConfidence } = typeStyling.labelSettings(type);
-          if (showLabel && !showConfidence) {
-            text = `${currentTypeIndication}${type}`;
-          } else if (showConfidence && !showLabel) {
-            text = `${currentTypeIndication}${confidence.toFixed(2)}`;
-          } else if (showConfidence && showLabel) {
-            text = `${currentTypeIndication}${type}: ${confidence.toFixed(2)}`;
-          }
-        }
-        arr.push({
-          selected: track.selected,
-          editing: track.editing,
-          type,
-          confidence,
-          text,
-          x: bounds[2],
-          y: -1, // updated below
-          currentPair: isCurrentPair,
-        });
-      }
-      return arr
-        .sort((a, b) => (+b.currentPair) - (+a.currentPair)) // sort currentPair=true first
-        .slice(0, totalVisiblePairs)
-        .map((v, i) => ({ ...v, y: bounds[1] - (lineHeight * i) })); // calculate y after sort
+  if (annotation.features && annotation.features.bounds) {
+    const { bounds } = annotation.features;
+    let confidencePairs = [annotation.styleType];
+    if (annotation.groups.length) {
+      confidencePairs = annotation.groups.map(({ confidencePairs: cp }) => {
+        const [_type, _conf] = cp[0];
+        return [
+          `${annotation.trackStyleType[0]}::${_type}`, _conf,
+        ];
+      });
     }
+    const arr: TextData[] = [];
+
+    for (let i = 0; i < confidencePairs.length; i += 1) {
+      const [type, confidence] = confidencePairs[i];
+
+      let text = '';
+      const userModified = annotation.features?.attributes?.userModified === true;
+      const userCreated = annotation.track.attributes?.userCreated === true;
+      // mdi-pencil (U+F03EB) / mdi-eye-off (U+F0209) — rendered via Material Design Icons
+      const modifiedIndicator = (showUserCreatedIcon && (userModified || userCreated))
+        ? ' \u{F03EB}' : '';
+      const suppressedIndicator = (showSuppressedTags && annotation.suppressed) ? ' \u{F0209}' : '';
+      if (typeStyling) {
+        const { showLabel, showConfidence } = typeStyling.labelSettings(type);
+        if (showLabel && !showConfidence) {
+          text = type + suppressedIndicator + modifiedIndicator;
+        } else if (showConfidence && !showLabel) {
+          text = `${confidence.toFixed(2)}${suppressedIndicator}${modifiedIndicator}`;
+        } else if (showConfidence && showLabel) {
+          text = `${type}${suppressedIndicator}: ${confidence.toFixed(2)}${modifiedIndicator}`;
+        }
+      }
+      arr.push({
+        selected: annotation.selected,
+        editing: annotation.editing,
+        type: annotation.styleType[0],
+        suppressed: annotation.suppressed,
+        confidence,
+        text,
+        x: bounds[2],
+        y: bounds[1],
+      });
+    }
+    if (annotation.track.set && confidencePairs.length) {
+      const { set } = annotation.track;
+      let text = '';
+      const [type, confidence] = confidencePairs[0];
+      if (typeStyling) {
+        const { showLabel } = typeStyling.labelSettings(set, true);
+        if (showLabel) {
+          text = set;
+          arr.push({
+            selected: annotation.selected,
+            editing: annotation.editing,
+            type,
+            confidence,
+            text,
+            x: bounds[2],
+            y: bounds[3],
+            offsetX: 10,
+            set,
+          });
+        }
+      }
+    }
+    return arr;
   }
   return null;
 }
@@ -76,8 +117,14 @@ function defaultFormatter(
 export default class TextLayer extends BaseLayer<TextData> {
   formatter: FormatTextRow;
 
+  showUserCreatedIcon: Ref<boolean>;
+
+  showSuppressedTags: Ref<boolean>;
+
   constructor(params: BaseLayerParams & TextLayerParams) {
     super(params);
+    this.showUserCreatedIcon = params.showUserCreatedIcon || { value: true } as Ref<boolean>;
+    this.showSuppressedTags = params.showSuppressedTags || { value: true } as Ref<boolean>;
     this.formatter = params.formatter || defaultFormatter;
   }
 
@@ -88,15 +135,17 @@ export default class TextLayer extends BaseLayer<TextData> {
     this.featureLayer = layer
       .createFeature('text')
       .text((data: TextData) => data.text)
-      .position((data: TextData) => ({ x: data.x, y: data.y }));
+      .position((data: TextData) => this.transformXY(data));
     super.initialize();
   }
 
   formatData(frameData: FrameDataTrack[]) {
     const arr = [] as TextData[];
     const typeStyling = this.typeStyling.value;
+    const showIcon = this.showUserCreatedIcon.value;
+    const showTags = this.showSuppressedTags.value;
     frameData.forEach((track: FrameDataTrack) => {
-      const formatted = this.formatter(track, typeStyling);
+      const formatted = this.formatter(track, typeStyling, showIcon, showTags);
       if (formatted !== null) {
         arr.push(...formatted);
       }
@@ -117,27 +166,26 @@ export default class TextLayer extends BaseLayer<TextData> {
     const baseStyle = super.createStyle();
     return {
       ...baseStyle,
+      // Include MDI so label glyphs (mdi-pencil, mdi-eye-off) render alongside text
+      font: 'bold 16px sans-serif, "Material Design Icons"',
       color: (data) => {
+        if (data.set) {
+          return this.typeStyling.value.annotationSetColor(data.set);
+        }
         if (data.editing || data.selected) {
-          if (!data.selected && !data.currentPair) {
+          if (!data.selected) {
             if (this.stateStyling.disabled.color !== 'type') {
               return this.stateStyling.disabled.color;
             }
             return this.typeStyling.value.color(data.type);
           }
-          if (data.selected && data.currentPair) {
+          if (data.selected) {
             return this.stateStyling.selected.color;
           }
           return this.typeStyling.value.color(data.type);
         }
         return this.typeStyling.value.color(data.type);
       },
-      textOpacity: ((data) => {
-        if (data.currentPair) {
-          return 1.0;
-        }
-        return this.stateStyling.disabled.opacity;
-      }),
       offset: (data) => ({
         x: data.offsetY || 3,
         y: data.offsetX || -8,

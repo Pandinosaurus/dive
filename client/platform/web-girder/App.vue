@@ -1,50 +1,143 @@
 <template>
   <v-app>
-    <router-view />
+    <router-view :key="accountId" />
+    <ScoringDatasetPickerDialog />
   </v-app>
 </template>
 
 <script lang="ts">
-import { defineComponent } from '@vue/composition-api';
+import { computed, defineComponent, watch } from 'vue';
+import { clearReviewSession } from 'dive-common/review/reviewSession';
 import { provideApi } from 'dive-common/apispec';
-import type { GirderMetadata } from './constants';
+import { useRoute } from 'vue-router/composables';
+import { useDataset } from 'platform/web-girder/store/useDataset';
+import { useLocation } from 'platform/web-girder/store/useLocation';
+import { clearMultiCamMetaCache } from './api/multicamResolve';
+import { useGirderRest } from './plugins/girder';
+import type { GirderConfig } from './constants';
 import {
   getPipelineList,
+  deleteTrainedPipeline,
   runPipeline,
+  watchPipelineJob,
+  exportTrainedPipeline,
+  getDatasetCalibration,
+  loadFrameMetadata,
   getTrainingConfigurations,
   runTraining,
-  saveMetadata,
+  saveConfig,
+  loadGlobalStyleSettings,
+  saveGlobalStyleSettings,
   saveAttributes,
+  saveAttributeTrackFilters,
   importAnnotationFile,
+  importCameraRegistration,
   loadDetections,
+  loadReviewTracks,
+  loadDatasetConfig,
   saveDetections,
   unwrap,
+  getTiles,
+  getTileURL,
+  getTileHistogram,
+  hasCalibrationFile,
+  downloadCalibration,
+  deleteCalibration,
+  runScoring,
+  watchScoringJob,
+  listScoringResults,
+  loadScoringResult,
+  deleteScoringResult,
+  listScoringSources,
+  listScoringDatasets,
+  listReviewDatasets,
+  resolveReviewDatasetId,
+  saveScoringExport,
+  exportScoringPdf,
+  pickScoringDataset,
+  pickReviewDataset,
 } from './api';
-import { openFromDisk } from './utils';
+import ScoringDatasetPickerDialog from './components/ScoringDatasetPickerDialog.vue';
+import {
+  getLastCalibration,
+  openFromDiskWithRegistry,
+  saveCalibration,
+  stashCalibrationFile,
+  stashTransformFile,
+  importCalibrationFile,
+} from './multicamFileRegistry';
+import { reportHandledPromiseRejection } from './reportHandledPromiseRejection';
 
 export default defineComponent({
   name: 'App',
-  components: {},
-  setup(_, { root }) {
-    async function loadMetadata(datasetId: string): Promise<GirderMetadata> {
-      return root.$store.dispatch('Dataset/load', datasetId);
+  components: { ScoringDatasetPickerDialog },
+  setup() {
+    const girderRest = useGirderRest();
+    const accountId = computed(() => girderRest.user?._id || '');
+    watch(accountId, () => {
+      clearReviewSession();
+      clearMultiCamMetaCache();
+    });
+    const route = useRoute();
+    const { loadDataset } = useDataset();
+    const { setLocationFromRoute } = useLocation();
+    async function loadConfig(datasetId: string): Promise<GirderConfig> {
+      return loadDataset(datasetId);
     }
 
-    root.$store.dispatch('Location/setLocationFromRoute', root.$route);
+    setLocationFromRoute(route).catch((reason) => {
+      reportHandledPromiseRejection('App: setLocationFromRoute', reason);
+    });
 
     provideApi({
       getPipelineList: unwrap(getPipelineList),
+      deleteTrainedPipeline: unwrap(deleteTrainedPipeline),
       runPipeline: unwrap(runPipeline),
+      watchPipelineJob,
+      exportTrainedPipeline: unwrap(exportTrainedPipeline),
+      getDatasetCalibration: unwrap(getDatasetCalibration),
+      downloadCalibration,
+      deleteCalibration,
       getTrainingConfigurations: unwrap(getTrainingConfigurations),
       runTraining: unwrap(runTraining),
-      loadDetections: unwrap(loadDetections),
+      loadDetections,
+      loadReviewTracks,
+      loadFrameMetadata,
       saveDetections: unwrap(saveDetections),
-      saveMetadata: unwrap(saveMetadata),
+      saveConfig: unwrap(saveConfig),
+      loadGlobalStyleSettings,
+      saveGlobalStyleSettings,
       saveAttributes: unwrap(saveAttributes),
-      loadMetadata,
-      openFromDisk,
+      saveAttributeTrackFilters: unwrap(saveAttributeTrackFilters),
+      loadConfig,
+      peekConfig: loadDatasetConfig,
+      hasCalibrationFile,
+      openFromDisk: openFromDiskWithRegistry,
+      getLastCalibration,
+      saveCalibration,
+      stashCalibrationFile,
+      stashTransformFile,
+      importCalibrationFile,
       importAnnotationFile,
+      importCameraRegistration,
+      getTiles,
+      getTileURL,
+      getTileHistogram,
+      runScoring: unwrap(runScoring),
+      watchScoringJob,
+      listScoringResults: unwrap(listScoringResults),
+      loadScoringResult: unwrap(loadScoringResult),
+      deleteScoringResult,
+      listScoringSources: unwrap(listScoringSources),
+      listScoringDatasets,
+      listReviewDatasets,
+      resolveReviewDatasetId,
+      pickScoringDataset,
+      pickReviewDataset,
+      saveScoringExport,
+      exportScoringPdf,
     });
+    return { accountId };
   },
 });
 </script>
